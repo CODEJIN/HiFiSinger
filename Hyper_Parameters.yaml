@@ -1,0 +1,87 @@
+Sound:
+    Spectrogram_Dim: 1025
+    Mel_Dim: 80
+    Frame_Length: 960   # 48000 / 1000 * 20ms
+    Frame_Shift: 240    # 48000 / 1000 * 5ms
+    Sample_Rate: 48000
+    Mel_F_Min: 0
+    Mel_F_Max: 22050
+    Max_Abs_Mel: 4
+
+Tokens: 78
+Max_Duration: 1000
+Max_Note: 128
+
+Encoder:
+    Size: 384
+    FFT_Block:
+        Heads: 2
+        Dropout_Rate: 0.1
+        Stacks: 6
+        FeedForward:
+            In_Kernel_Size: 3
+            Out_Kernel_Size: 1
+            Channels: 1536
+
+Duration_Predictor:
+    Conv:
+        Kernel_Size: [3, 3]
+        Channels: [256, 256]
+
+Decoder:
+    FFT_Block:
+        Heads: 2
+        Dropout_Rate: 0.1
+        Stacks: 6
+        FeedForward:
+            In_Kernel_Size: 3
+            Out_Kernel_Size: 1
+            Channels: 1536
+
+Vocoder_Path: None  # Paper is using PWGAN. This part need another model.
+
+Token_Path: 'E:/48K.KO_Music/Token.yaml'
+Train:
+    Use_Pattern_Cache: false
+    Token_Length: 20
+    Max_Mel_Length: 1500
+    Train_Pattern:
+        Path: 'E:/48K.KO_Music/Train'
+        Metadata_File: 'METADATA.PICKLE'
+        Accumulated_Dataset_Epoch: 100   # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
+    Eval_Pattern:
+        Path: 'E:/48K.KO_Music/Eval'
+        Metadata_File: 'METADATA.PICKLE'
+        Mel_Length:
+            Min: 50
+            Max: 1200
+        Text_Length:
+            Min: 10
+            Max: 200
+    Num_Workers: 2
+    Batch_Size: 4 # 64
+    Learning_Rate:
+        Initial: 1.0e-3
+        Base: 4000
+    ADAM:
+        Beta1: 0.9
+        Beta2: 0.999
+        Epsilon: 1.0e-7
+    Weight_Decay: 0.0 # 1.0e-6
+    Gradient_Norm: 0.2
+    Max_Step: 200000
+    Checkpoint_Save_Interval: 1000
+    Logging_Interval: 100
+    Evaluation_Interval: 1000
+    Inference_Interval: 1000
+    Initial_Inference: true
+    Inference_Pattern_in_Train: 'Inference_Text.txt'
+
+Inference_Batch_Size: 4
+Inference_Path: '/data/results/Parallel_Tacotron/EYJ.VAE.Basic/Inference'
+Checkpoint_Path: '/data/results/Parallel_Tacotron/EYJ.VAE.Basic/Checkpoint'
+Log_Path: '/data/results/Parallel_Tacotron/EYJ.VAE.Basic/Log'
+
+Use_Mixed_Precision: false  # apex is required.
+Use_Multi_GPU: true
+Device: '0, 1, 2, 3, 4, 5, 6, 7'
