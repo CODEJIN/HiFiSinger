@@ -3,12 +3,9 @@
 
 import torch
 import numpy as np
-import pickle, os, math, logging
+import pickle, os
 from random import randint
-from argparse import Namespace  # for type
 from multiprocessing import Manager
-
-from Pattern_Generator import Pattern_Generate, Decompose
 
 def Text_to_Token(notes, token_dict):
     return [
@@ -24,6 +21,25 @@ def Mel_Stack(mels, max_abs_mel):
         )
 
     return mels
+
+def Silence_Stack(silences):
+    max_Silences_Length = max([silence.shape[0] for silence in silences])
+    silences = np.stack(
+        [np.pad(silence, [0, max_Silences_Length - silence.shape[0]], constant_values= 0.0) for silence in silences],
+        axis= 0
+        )
+
+    return silences
+
+def Pitch_Stack(pitches):
+    max_Pitch_Length = max([pitch.shape[0] for pitch in pitches])
+    pitches = np.stack(
+        [np.pad(pitch, [0, max_Pitch_Length - pitch.shape[0]], constant_values= 0.0) for pitch in pitches],
+        axis= 0
+        )
+
+    return pitches
+
 
 def Duration_Correct(durations):
     '''
@@ -65,7 +81,7 @@ class Dataset(torch.utils.data.Dataset):
 
         path = os.path.join(self.pattern_Path, self.patterns[idx]).replace('\\', '/')
         pattern_Dict = pickle.load(open(path, 'rb'))
-        pattern = Text_to_Token(pattern_Dict['Note'], self.token_Dict), pattern_Dict['Mel']
+        pattern = Text_to_Token(pattern_Dict['Note'], self.token_Dict), pattern_Dict['Mel'], pattern_Dict['Silence'], pattern_Dict['Pitch']
         if self.use_cache:
             self.cache_Dict[self.metadata_Path, idx % self.base_Length] = pattern
         
@@ -117,28 +133,38 @@ class Collater:
         token_dict: dict,
         token_length: int,
         max_mel_length: int,
-        max_abs_mel: float
+        max_abs_mel: float,
+        max_duration: int
         ):
         self.token_Dict = token_dict
         self.token_Length = token_length
         self.max_Mel_Length = max_mel_length
         self.max_ABS_Mel = max_abs_mel
+        self.max_Duration = max_duration
 
     def __call__(self, batch: list):
-        durations, tokens, notes, mels = [], [], [], []
-        for note, mel in batch:
-            offset = randint(0, len(note) - self.token_Length)
-            note = note[offset:offset + self.token_Length]
-            absolute_duration, duration, token, note = zip(*note)
-            mel = mel[absolute_duration[0]:absolute_duration[-1] + duration[-1]]
-            
-            if mel.shape[0] > self.max_Mel_Length:
-                continue
-
-            durations.append(np.array(duration + (0,), dtype=np.float32))
-            tokens.append(np.array(token + (self.token_Dict['<E>'],), dtype=np.float32))
-            notes.append(np.array(note + (0,), dtype=np.float32))
-            mels.append(mel)
+        durations, tokens, notes, mels, silences, pitches = [], [], [], [], [], []
+        for music, mel, silence, pitch in batch:
+            for _ in range(10): # If pattern generating failed until 10 times, skipped.
+                offset = randint(0, len(music) - self.token_Length)
+                music_Sample = music[offset:offset + self.token_Length]
+                absolute_duration, duration_Sample, token_Sample, note_Sample = zip(*music_Sample)
+                mel_Sample = mel[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
+                silence_Sample = silence[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
+                pitch_Sample = pitch[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
+                if all([
+                    mel_Sample.shape[0] < self.max_Mel_Length,
+                    mel_Sample.shape[0] - min([x.shape[0] for x in mels + [mel_Sample]]) < self.max_Duration, #padding also must be shorter than max duration.
+                    max([x.shape[0] for x in mels + [mel_Sample]]) - mel_Sample.shape[0] < self.max_Duration, #padding also must be shorter than max duration.
+                    np.max(duration_Sample) < self.max_Duration
+                    ]):
+                    durations.append(np.array(duration_Sample + (0,), dtype=np.float32))
+                    tokens.append(np.array(token_Sample + (self.token_Dict['<E>'],), dtype=np.float32))
+                    notes.append(np.array(note_Sample + (0,), dtype=np.float32))
+                    mels.append(mel_Sample)
+                    silences.append(silence_Sample)
+                    pitches.append(pitch_Sample)
+                    break
 
         mel_Lengths = [mel.shape[0] for mel in mels]
 
@@ -146,27 +172,33 @@ class Collater:
         tokens = np.stack(tokens, axis= 0)
         notes = np.stack(notes, axis= 0)
         mels = Mel_Stack(mels, self.max_ABS_Mel)
+        silences = Silence_Stack(silences)
+        pitches = Pitch_Stack(pitches)
 
         durations = torch.LongTensor(durations)   # [Batch, Time]
         tokens = torch.LongTensor(tokens)   # [Batch, Time]
         notes = torch.LongTensor(notes)   # [Batch, Time]
         mels = torch.FloatTensor(mels).transpose(2, 1)   # [Batch, Mel_dim, Time]
         mel_Lengths = torch.LongTensor(mel_Lengths)   # [Batch]
+        silences = torch.FloatTensor(silences)   # [Batch, Time]
+        pitches = torch.FloatTensor(pitches)   # [Batch, Time]
 
-        return durations, tokens, notes, mels, mel_Lengths
+        return durations, tokens, notes, mels, mel_Lengths, silences, pitches
 
 class Inference_Collater:
     def __init__(
         self,
         token_dict: dict,
-        max_abs_mel: float
+        max_abs_mel: float,
+        max_duration: int
         ):
         self.token_Dict = token_dict
         self.max_ABS_Mel = max_abs_mel
+        self.max_Duration = max_duration
          
     def __call__(self, batch: list):
         durations, tokens, notes, labels = [], [], [], []
-        for note, label in batch:
+        for note, label in batch:            
             _, duration, token, note = zip(*note)
             durations.append(np.array(duration + (0,), dtype=np.float32))
             tokens.append(np.array(token + (self.token_Dict['<E>'],), dtype=np.float32))
@@ -176,6 +208,9 @@ class Inference_Collater:
         durations = Duration_Correct(np.stack(durations, axis= 0))
         tokens = np.stack(tokens, axis= 0)
         notes = np.stack(notes, axis= 0)
+
+        if np.max(durations) > self.max_Duration:
+            raise ValueError('There is some notes which have longer duration({}) than max duration({}).'.format(np.max(durations), self.max_Duration))
 
         durations = torch.LongTensor(durations)   # [Batch, Time]
         tokens = torch.LongTensor(tokens)   # [Batch, Time]

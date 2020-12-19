@@ -1,9 +1,10 @@
 import numpy as np
-import mido, os, pickle, yaml, hgtk, argparse
+import mido, os, pickle, yaml, hgtk, argparse, math
 from tqdm import tqdm
 from argparse import Namespace  # for type
 
 from Audio import Audio_Prep, Mel_Generate
+from yin import pitch_calc
 from Arg_Parser import Recursive_Parse
 
 def Decompose(syllable):
@@ -16,6 +17,10 @@ def Pattern_Generate(
     hyper_paramters: Namespace,
     dataset_path: str
     ):
+    temp = []
+    min_Duration, max_Duration = math.inf, -math.inf
+    min_Note, max_Note = math.inf, -math.inf
+
     paths = []
     for root, _, files in os.walk(dataset_path):
         for file in files:
@@ -71,14 +76,28 @@ def Pattern_Generate(
                 max_abs_value= hyper_paramters.Sound.Max_Abs_Mel
                 )[:absolute_Position]   # Usually, 1 or 2 step of mel is cut.
 
+            pitch = pitch_calc(
+                sig= audio,
+                sr= hyper_paramters.Sound.Sample_Rate,
+                w_len= hyper_paramters.Sound.Frame_Length,
+                w_step= hyper_paramters.Sound.Frame_Shift,
+                f0_min= hyper_paramters.Sound.F0_Min,
+                f0_max= hyper_paramters.Sound.F0_Max,
+                confidence_threshold= hyper_paramters.Sound.Confidence_Threshold,
+                gaussian_smoothing_sigma = hyper_paramters.Sound.Gaussian_Smoothing_Sigma
+                )[:absolute_Position]# / hyper_paramters.Sound.F0_Max
+
+            silence = np.where(np.mean(mel, axis=1) < -3.85, np.zeros_like(np.mean(mel, axis=1)), np.ones_like(np.mean(mel, axis=1)))
+
             pattern = {
                 'Audio': audio.astype(np.float32),
                 'Mel': mel.astype(np.float32),
+                'Pitch': pitch.astype(np.float32),
+                'Silence': silence.astype(np.uint8),
                 'Note': notes,
                 'Singer': 'Female_0', 
-                'Dataset': 'NAMS', 
+                'Dataset': 'NAMS',
                 }
-            
 
             pattern_Path = os.path.join(
                 hyper_paramters.Train.Train_Pattern.Path if index < len(paths) - 1 else hyper_paramters.Train.Eval_Pattern.Path,
@@ -91,6 +110,20 @@ def Pattern_Generate(
                 open(pattern_Path, 'wb'),
                 protocol=4
                 )
+
+            temp.extend(list(zip(*notes))[1])
+
+            min_Duration, max_Duration = min(list(zip(*notes))[1] + (min_Duration,)), max(list(zip(*notes))[1] + (max_Duration,))
+            min_Note, max_Note = min(list(zip(*notes))[3] + (min_Note,)), max(list(zip(*notes))[3] + (max_Note,))
+
+    
+    temp = [x for x in temp if x !=0 and x != 2]
+    import matplotlib.pyplot as plt
+    plt.hist(temp, 500)
+    plt.show()
+
+    print('Duration range: {} - {}'.format(min_Duration, max_Duration))
+    print('Note range: {} - {}'.format(min_Note, max_Note))
 
 def Token_Dict_Generate(hyper_parameters: Namespace):
     tokens = \
@@ -174,3 +207,5 @@ if __name__ == "__main__":
     Pattern_Generate(hyper_paramters= hp, dataset_path= args.dataset_path)
     Metadata_Generate(hp, False)
     Metadata_Generate(hp, True)
+
+    # python Pattern_Generator.py -hp Hyper_Parameters.yaml -d E:/Kor_Music_Confidential

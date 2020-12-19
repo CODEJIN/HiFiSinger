@@ -1,27 +1,22 @@
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T'    # This is ot prevent to be called Fortran Ctrl+C crash in Windows.
 import torch
 import numpy as np
-import logging, yaml, os, sys, argparse, time, math
+import logging, yaml, sys, argparse, math
 from tqdm import tqdm
 from collections import defaultdict
-from tensorboardX import SummaryWriter
 import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from random import sample
 import torch.multiprocessing as mp
 
-from Modules import HifiSinger, Silence_Loss, Note_Loss
+from Modules import HifiSinger
 from Datasets import Dataset, Inference_Dataset, Collater, Inference_Collater
 from Radam import RAdam
 from Noam_Scheduler import Modified_Noam_Scheduler
 from Logger import Logger
 from Arg_Parser import Recursive_Parse
-
-#Unicode problem for Korean
-import matplotlib as mpl
-mpl.rcParams['axes.unicode_minus'] = False
-plt.rcParams["font.family"] = 'NanumGothic'
 
 logging.basicConfig(
     level=logging.INFO, stream=sys.stdout,
@@ -100,13 +95,15 @@ class Trainer:
 
         collater = Collater(
             token_dict= token_Dict,
-            token_length= hp.Train.Token_Length,
-            max_mel_length= hp.Train.Max_Mel_Length,
-            max_abs_mel= hp.Sound.Max_Abs_Mel
+            token_length= self.hp.Train.Token_Length,
+            max_mel_length= self.hp.Train.Max_Mel_Length,
+            max_abs_mel= self.hp.Sound.Max_Abs_Mel,
+            max_duration= self.hp.Max_Duration
             )
         inference_Collater = Inference_Collater(
             token_dict= token_Dict,
-            max_abs_mel= self.hp.Sound.Max_Abs_Mel
+            max_abs_mel= self.hp.Sound.Max_Abs_Mel,
+            max_duration= self.hp.Max_Duration
             )
 
         self.dataLoader_Dict = {}
@@ -148,9 +145,7 @@ class Trainer:
 
         self.criterion_Dict = {
             'Mean_Absolute_Error': torch.nn.L1Loss(reduction= 'none').to(self.device),
-            'Mean_Squared_Error': torch.nn.MSELoss().to(self.device),
-            'Silence_Loss`': Silence_Loss().to(self.device),
-            'Note_Loss': Note_Loss().to(self.device)
+            'Binary_Cross_Entropy_Loss': torch.nn.BCEWithLogitsLoss(reduction= 'none').to(self.device)
             }
         self.optimizer = RAdam(
             params= self.model.parameters(),
@@ -176,7 +171,7 @@ class Trainer:
         if self.gpu_id == 0:
             logging.info(self.model)
 
-    def Train_Step(self, durations, tokens, notes, mels, mel_lengths):
+    def Train_Step(self, durations, tokens, notes, mels, mel_lengths, silences, pitches):
         loss_Dict = {}
 
         durations = durations.to(self.device, non_blocking=True)
@@ -184,20 +179,28 @@ class Trainer:
         notes = notes.to(self.device, non_blocking=True)
         mels = mels.to(self.device, non_blocking=True)
         mel_lengths = mel_lengths.to(self.device, non_blocking=True)
+        silences = silences.to(self.device, non_blocking=True)
+        pitches = pitches.to(self.device, non_blocking=True)
 
-        predicted_Mels, predicted_Silences, predicted_Notes, predicted_Durations = self.model(
+        predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
             notes= notes
             )
 
+        # print(predicted_Mels.shape, mels.shape)
+
         loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
         loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
         loss_Dict['Mel'] = loss_Dict['Mel'].mean()
-        loss_Dict['Silence'] = self.criterion_Dict['Silence_Loss'](predicted_Silences, notes)
-        loss_Dict['Note'] = self.criterion_Dict['Note_Loss'](predicted_Notes, notes)
-        loss_Dict['Predicted_Duration'] = self.criterion_Dict['MSE'](predicted_Durations, durations)
-        loss_Dict['Total'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Note'] + loss_Dict['Predicted_Duration']
+        loss_Dict['Silence'] = self.criterion_Dict['Binary_Cross_Entropy_Loss'](predicted_Silences, silences)
+        loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
+        loss_Dict['Silence'] = loss_Dict['Silence'].mean()
+        loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
+        loss_Dict['Pitch'] = loss_Dict['Pitch'].sum(dim= 1) / mel_lengths.float()
+        loss_Dict['Pitch'] = loss_Dict['Pitch'].mean()
+        loss_Dict['Predicted_Duration'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Durations, durations.float()).mean()
+        loss_Dict['Total'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Pitch'] + loss_Dict['Predicted_Duration']
 
         self.optimizer.zero_grad()
         if self.hp.Use_Mixed_Precision:
@@ -225,8 +228,8 @@ class Trainer:
             self.scalar_Dict['Train']['Loss/{}'.format(tag)] += loss
 
     def Train_Epoch(self):
-        for durations, tokens, notes, mels, mel_lengths in self.dataLoader_Dict['Train']:
-            self.Train_Step(durations, tokens, notes, mels, mel_lengths)
+        for durations, tokens, notes, mels, mel_lengths, silences, pitches in self.dataLoader_Dict['Train']:
+            self.Train_Step(durations, tokens, notes, mels, mel_lengths, silences, pitches)
             
             if self.steps % self.hp.Train.Checkpoint_Save_Interval == 0:
                 self.Save_Checkpoint()
@@ -250,16 +253,18 @@ class Trainer:
                 return
 
     @torch.no_grad()
-    def Evaluation_Step(self, durations, tokens, notes, mels, mel_lengths):
+    def Evaluation_Step(self, durations, tokens, notes, mels, mel_lengths, silences, pitches):
         loss_Dict = {}
-        
+
         durations = durations.to(self.device, non_blocking=True)
         tokens = tokens.to(self.device, non_blocking=True)
         notes = notes.to(self.device, non_blocking=True)
         mels = mels.to(self.device, non_blocking=True)
         mel_lengths = mel_lengths.to(self.device, non_blocking=True)
+        silences = silences.to(self.device, non_blocking=True)
+        pitches = pitches.to(self.device, non_blocking=True)
 
-        predicted_Mels, predicted_Silences, predicted_Notes, predicted_Durations = self.model(
+        predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
             notes= notes
@@ -268,15 +273,19 @@ class Trainer:
         loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
         loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
         loss_Dict['Mel'] = loss_Dict['Mel'].mean()
-        loss_Dict['Silence'] = self.criterion_Dict['Silence_Loss'](predicted_Silences, notes)
-        loss_Dict['Note'] = self.criterion_Dict['Note_Loss'](predicted_Notes, notes)
-        loss_Dict['Predicted_Duration'] = self.criterion_Dict['MSE'](predicted_Durations, durations)
-        loss_Dict['Total'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Note'] + loss_Dict['Predicted_Duration']
+        loss_Dict['Silence'] = self.criterion_Dict['Binary_Cross_Entropy_Loss'](predicted_Silences, silences)
+        loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
+        loss_Dict['Silence'] = loss_Dict['Silence'].mean()
+        loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
+        loss_Dict['Pitch'] = loss_Dict['Pitch'].sum(dim= 1) / mel_lengths.float()
+        loss_Dict['Pitch'] = loss_Dict['Pitch'].mean()
+        loss_Dict['Predicted_Duration'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Durations, durations.float()).mean()
+        loss_Dict['Total'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Pitch'] + loss_Dict['Predicted_Duration']
 
         for tag, loss in loss_Dict.items():
             self.scalar_Dict['Evaluation']['Loss/{}'.format(tag)] += loss.cpu()
 
-        return predicted_Mels, predicted_Silences, predicted_Notes, predicted_Durations
+        return predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations
 
     def Evaluation_Epoch(self):
         if self.gpu_id != 0:
@@ -286,12 +295,12 @@ class Trainer:
 
         self.model.eval()
 
-        for step, (durations, tokens, notes, mels, mel_lengths) in tqdm(
+        for step, (durations, tokens, notes, mels, mel_lengths, silences, pitches) in tqdm(
             enumerate(self.dataLoader_Dict['Eval'], 1),
             desc='[Evaluation]',
             total= math.ceil(len(self.dataLoader_Dict['Eval'].dataset) / self.hp.Train.Batch_Size)
             ):
-            predicted_Mels, predicted_Silences, predicted_Notes, predicted_Durations = self.Evaluation_Step(durations, tokens, notes, mels, mel_lengths)
+            predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.Evaluation_Step(durations, tokens, notes, mels, mel_lengths, silences, pitches)
 
         self.scalar_Dict['Evaluation'] = {
             tag: loss / step
@@ -301,20 +310,17 @@ class Trainer:
         self.writer_Dict['Evaluation'].add_histogram_model(self.model, self.steps, delete_keywords=['layer_Dict', 'layer'])
         self.scalar_Dict['Evaluation'] = defaultdict(float)
 
-        note = notes[-1].repeat_interleave(durations[-1])
-        silence = torch.where(note, torch.ones_like(note), torch.zeros_like(note)).float()
-
-        duration = durations[-1, :token_Lengths[-1]]
-        duration = torch.arange(duration.size(0)).to(duration.device).repeat_interleave(duration).cpu().numpy()
-        predicted_Duration = predicted_Durations[-1, :token_Lengths[-1]].ceil().long().clamp(0, self.hp.Max_Duration)
-        predicted_Duration = torch.arange(predicted_Duration.size(0)).to(predicted_Duration.device).repeat_interleave(predicted_Duration).cpu().numpy()        
+        duration = durations[-1]
+        duration = torch.arange(duration.size(0)).repeat_interleave(duration.cpu()).numpy()
+        predicted_Duration = predicted_Durations[-1].ceil().long().clamp(0, self.hp.Max_Duration)
+        predicted_Duration = torch.arange(predicted_Duration.size(0)).repeat_interleave(predicted_Duration.cpu()).numpy()
         image_Dict = {
             'Mel/Target': (mels[-1, :mel_lengths[-1]].cpu().numpy(), None),
             'Mel/Prediction': (predicted_Mels[-1, :mel_lengths[-1]].cpu().numpy(), None),
-            'Silence/Target': (silence.cpu().numpy(), None),
-            'Silence/Prediction': (predicted_Silences[-1].cpu().numpy(), None),
-            'Note/Target': (note.cpu().numpy(), None),
-            'Note/Prediction': (predicted_Notes[-1].cpu().numpy(), None),
+            'Silence/Target': (silences[-1, :mel_lengths[-1]].cpu().numpy(), None),
+            'Silence/Prediction': (predicted_Silences[-1, :mel_lengths[-1]].cpu().numpy(), None),
+            'Pitch/Target': (pitches[-1, :mel_lengths[-1]].cpu().numpy(), None),
+            'Pitch/Prediction': (predicted_Pitches[-1, :mel_lengths[-1]].cpu().numpy(), None),
             'Duration/Target': (durations[-1].cpu().numpy(), None),
             'Duration/Prediction': (predicted_Durations[-1].cpu().numpy(), None),
             }
@@ -328,7 +334,7 @@ class Trainer:
         tokens = tokens.to(self.device, non_blocking=True)
         notes = notes.to(self.device, non_blocking=True)
 
-        predicted_Mels, predicted_Silences, predicted_Notes, predicted_Durations = self.model(
+        predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
             notes= notes
@@ -344,10 +350,10 @@ class Trainer:
 
         os.makedirs(os.path.join(self.hp.Inference_Path, 'Step-{}'.format(self.steps), 'PNG').replace('\\', '/'), exist_ok= True)
         os.makedirs(os.path.join(self.hp.Inference_Path, 'Step-{}'.format(self.steps), 'NPY', 'Mel').replace('\\', '/'), exist_ok= True)
-        for mel, silence, note, duration, label, file in zip(
+        for mel, silence, pitch, duration, label, file in zip(
             predicted_Mels.cpu(),
             predicted_Silences.cpu(),
-            predicted_Notes.cpu(),
+            predicted_Pitches.cpu(),
             predicted_Durations.cpu(),
             labels,
             files
@@ -364,9 +370,9 @@ class Trainer:
             plt.title('Silence    {}'.format(title))
             plt.colorbar()
             plt.subplot2grid((4, 1), (2, 0))
-            plt.plot(note)
+            plt.plot(pitch)
             plt.margins(x= 0)
-            plt.title('Note    {}'.format(title))
+            plt.title('Pitch    {}'.format(title))
             plt.colorbar()
             duration = duration.ceil().long().clamp(0, self.hp.Max_Duration)
             duration = torch.arange(duration.size(0)).repeat_interleave(duration)
@@ -388,11 +394,13 @@ class Trainer:
         # This part may be changed depending on the vocoder used.
         if not self.vocoder is None:
             os.makedirs(os.path.join(self.hp.Inference_Path, 'Step-{}'.format(self.steps), 'Wav').replace('\\', '/'), exist_ok= True)
-            for mel, file in zip(predicted_Mels, files):
+            for mel, silence, pitch, file in zip(predicted_Mels, predicted_Silences, predicted_Pitches, files):
                 mel = mel.unsqueeze(0)
+                silence = silence.unsqueeze(0)
+                pitch = pitch.unsqueeze(0)
                 x = torch.randn(size=(mel.size(0), self.hp.Sound.Frame_Shift * mel.size(2))).to(mel.device)
                 mel = torch.nn.functional.pad(mel, (2,2), 'reflect')
-                wav = self.vocoder(x, mel).cpu().numpy()[0]
+                wav = self.vocoder(x, mel, silence, pitch).cpu().numpy()[0]
                 wavfile.write(
                     filename= os.path.join(self.hp.Inference_Path, 'Step-{}'.format(self.steps), 'Wav', '{}.wav'.format(file)).replace('\\', '/'),
                     data= (np.clip(wav, -1.0 + 1e-7, 1.0 - 1e-7) * 32767.5).astype(np.int16),
