@@ -15,3 +15,6 @@ x = torch.randn(3, 384, 523)
 out = layer(x)
 
 print(out.shape)
+
+
+np.where(np.mean(x['Mel'], axis=1) < -3.0, np.zeros_like(np.mean(x['Mel'], axis=1)), np.ones_like(np.mean(x['Mel'], axis=1)))

@@ -13,11 +13,18 @@ Sound:
     F0_Max: 500
 
 Tokens: 78
-Max_Duration: 800
-Max_Note: 128
+Max_Note: 87
+Min_Duration: 600
+Max_Duration: 1500
+
 
 Encoder:
     Size: 384
+    Conv_Kernel_Size: [5, 5, 5]
+    Heads: 2
+    Dropout_Rate: 0.1
+    Stacks: 6
+    FeedForward_Channels: 1536
     FFT_Block:
         Heads: 2
         Dropout_Rate: 0.1
@@ -31,8 +38,14 @@ Duration_Predictor:
     Conv:
         Kernel_Size: [3, 3]
         Channels: [256, 256]
+        Dropout_Rate: 0.1
 
 Decoder:
+    Size: 384   # I think this must be same to encoder size.
+    Heads: 2
+    Dropout_Rate: 0.1
+    Stacks: 6
+    FeedForward_Channels: 1536
     FFT_Block:
         Heads: 2
         Dropout_Rate: 0.1
@@ -42,36 +55,34 @@ Decoder:
             Out_Kernel_Size: 1
             Channels: 1536
 
-Vocoder_Path: null  # Paper is using PWGAN. This part need another model.
+Vocoder_Path: null  # Paper is using PWGAN. This part needs another model.
 
 Token_Path: 'E:/48K.KO_Music/Token.yaml'
 Train:
     Use_Pattern_Cache: false
-    Token_Length: 20
-    Max_Mel_Length: 1500
     Train_Pattern:
         Path: 'E:/48K.KO_Music/Train'
         Metadata_File: 'METADATA.PICKLE'
-        Accumulated_Dataset_Epoch: 100   # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
+        Accumulated_Dataset_Epoch: 1   # This is to prevent slow down from torch.utils.data.DataLoader when the number of patterns is small.
     Eval_Pattern:
         Path: 'E:/48K.KO_Music/Eval'
         Metadata_File: 'METADATA.PICKLE'
     Num_Workers: 2
-    Batch_Size: 16 # 64
+    Batch_Size: 8 # 64
     Learning_Rate:
-        Initial: 1.0e-3
+        Initial: 1.0e-4
         Base: 4000
     ADAM:
         Beta1: 0.9
         Beta2: 0.999
         Epsilon: 1.0e-7
     Weight_Decay: 1.0e-6
-    Gradient_Norm: 5.0
+    Gradient_Norm: 0.5
     Max_Step: 200000
-    Checkpoint_Save_Interval: 1000
+    Checkpoint_Save_Interval: 10000
     Logging_Interval: 100
     Evaluation_Interval: 1000
-    Inference_Interval: 1000
+    Inference_Interval: 10000
     Initial_Inference: false
     Inference_Pattern_in_Train: 'Inference_Text.txt'
 
@@ -80,6 +91,6 @@ Inference_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Inference'
 Checkpoint_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Checkpoint'
 Log_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Log'
 
-Use_Mixed_Precision: true  # apex is required.
+Use_Mixed_Precision: false  # apex is required.
 Use_Multi_GPU: false
 Device: '1'

@@ -95,15 +95,11 @@ class Trainer:
 
         collater = Collater(
             token_dict= token_Dict,
-            token_length= self.hp.Train.Token_Length,
-            max_mel_length= self.hp.Train.Max_Mel_Length,
-            max_abs_mel= self.hp.Sound.Max_Abs_Mel,
-            max_duration= self.hp.Max_Duration
+            max_abs_mel= self.hp.Sound.Max_Abs_Mel
             )
         inference_Collater = Inference_Collater(
             token_dict= token_Dict,
-            max_abs_mel= self.hp.Sound.Max_Abs_Mel,
-            max_duration= self.hp.Max_Duration
+            max_abs_mel= self.hp.Sound.Max_Abs_Mel
             )
 
         self.dataLoader_Dict = {}
@@ -171,29 +167,29 @@ class Trainer:
         if self.gpu_id == 0:
             logging.info(self.model)
 
-    def Train_Step(self, durations, tokens, notes, mels, mel_lengths, silences, pitches):
+    def Train_Step(self, durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths):
         loss_Dict = {}
 
         durations = durations.to(self.device, non_blocking=True)
         tokens = tokens.to(self.device, non_blocking=True)
         notes = notes.to(self.device, non_blocking=True)
+        token_lengths = token_lengths.to(self.device, non_blocking=True)
         mels = mels.to(self.device, non_blocking=True)
-        mel_lengths = mel_lengths.to(self.device, non_blocking=True)
         silences = silences.to(self.device, non_blocking=True)
         pitches = pitches.to(self.device, non_blocking=True)
+        mel_lengths = mel_lengths.to(self.device, non_blocking=True)
 
         predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
-            notes= notes
+            notes= notes,
+            token_lengths= token_lengths
             )
-
-        # print(predicted_Mels.shape, mels.shape)
 
         loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
         loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
         loss_Dict['Mel'] = loss_Dict['Mel'].mean()
-        loss_Dict['Silence'] = self.criterion_Dict['Binary_Cross_Entropy_Loss'](predicted_Silences, silences)
+        loss_Dict['Silence'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Silences, silences)  # BCE is faster, but loss increase infinity because the silence cannot tracking perfectly.
         loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
         loss_Dict['Silence'] = loss_Dict['Silence'].mean()
         loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
@@ -216,11 +212,9 @@ class Trainer:
                 parameters= self.model.parameters(),
                 max_norm= self.hp.Train.Gradient_Norm
                 )
-        torch.cuda.synchronize()
-
+        
         self.optimizer.step()
         self.scheduler.step()
-        torch.cuda.synchronize()
         self.steps += 1
         self.tqdm.update(1)
 
@@ -228,8 +222,8 @@ class Trainer:
             self.scalar_Dict['Train']['Loss/{}'.format(tag)] += loss
 
     def Train_Epoch(self):
-        for durations, tokens, notes, mels, mel_lengths, silences, pitches in self.dataLoader_Dict['Train']:
-            self.Train_Step(durations, tokens, notes, mels, mel_lengths, silences, pitches)
+        for durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths in self.dataLoader_Dict['Train']:
+            self.Train_Step(durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths)
             
             if self.steps % self.hp.Train.Checkpoint_Save_Interval == 0:
                 self.Save_Checkpoint()
@@ -253,27 +247,29 @@ class Trainer:
                 return
 
     @torch.no_grad()
-    def Evaluation_Step(self, durations, tokens, notes, mels, mel_lengths, silences, pitches):
+    def Evaluation_Step(self, durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths):
         loss_Dict = {}
 
         durations = durations.to(self.device, non_blocking=True)
         tokens = tokens.to(self.device, non_blocking=True)
         notes = notes.to(self.device, non_blocking=True)
+        token_lengths = token_lengths.to(self.device, non_blocking=True)
         mels = mels.to(self.device, non_blocking=True)
-        mel_lengths = mel_lengths.to(self.device, non_blocking=True)
         silences = silences.to(self.device, non_blocking=True)
         pitches = pitches.to(self.device, non_blocking=True)
+        mel_lengths = mel_lengths.to(self.device, non_blocking=True)
 
         predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
-            notes= notes
+            notes= notes,
+            token_lengths= token_lengths
             )
 
         loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
         loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
         loss_Dict['Mel'] = loss_Dict['Mel'].mean()
-        loss_Dict['Silence'] = self.criterion_Dict['Binary_Cross_Entropy_Loss'](predicted_Silences, silences)
+        loss_Dict['Silence'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Silences, silences)  # BCE is faster, but loss increase infinity because the silence cannot tracking perfectly.
         loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
         loss_Dict['Silence'] = loss_Dict['Silence'].mean()
         loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
@@ -295,12 +291,12 @@ class Trainer:
 
         self.model.eval()
 
-        for step, (durations, tokens, notes, mels, mel_lengths, silences, pitches) in tqdm(
+        for step, (durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths) in tqdm(
             enumerate(self.dataLoader_Dict['Eval'], 1),
             desc='[Evaluation]',
             total= math.ceil(len(self.dataLoader_Dict['Eval'].dataset) / self.hp.Train.Batch_Size)
             ):
-            predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.Evaluation_Step(durations, tokens, notes, mels, mel_lengths, silences, pitches)
+            predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.Evaluation_Step(durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths)
 
         self.scalar_Dict['Evaluation'] = {
             tag: loss / step
@@ -315,29 +311,31 @@ class Trainer:
         predicted_Duration = predicted_Durations[-1].ceil().long().clamp(0, self.hp.Max_Duration)
         predicted_Duration = torch.arange(predicted_Duration.size(0)).repeat_interleave(predicted_Duration.cpu()).numpy()
         image_Dict = {
-            'Mel/Target': (mels[-1, :mel_lengths[-1]].cpu().numpy(), None),
-            'Mel/Prediction': (predicted_Mels[-1, :mel_lengths[-1]].cpu().numpy(), None),
+            'Mel/Target': (mels[-1, :, :mel_lengths[-1]].cpu().numpy(), None),
+            'Mel/Prediction': (predicted_Mels[-1, :, :mel_lengths[-1]].cpu().numpy(), None),
             'Silence/Target': (silences[-1, :mel_lengths[-1]].cpu().numpy(), None),
             'Silence/Prediction': (predicted_Silences[-1, :mel_lengths[-1]].cpu().numpy(), None),
             'Pitch/Target': (pitches[-1, :mel_lengths[-1]].cpu().numpy(), None),
             'Pitch/Prediction': (predicted_Pitches[-1, :mel_lengths[-1]].cpu().numpy(), None),
-            'Duration/Target': (durations[-1].cpu().numpy(), None),
-            'Duration/Prediction': (predicted_Durations[-1].cpu().numpy(), None),
+            'Duration/Target': (duration, None),
+            'Duration/Prediction': (predicted_Duration, None),
             }
         self.writer_Dict['Evaluation'].add_image_dict(image_Dict, self.steps)
 
         self.model.train()
 
     @torch.no_grad()
-    def Inference_Step(self, durations, tokens, notes, labels, start_index= 0, tag_step= False):
+    def Inference_Step(self, durations, tokens, notes, token_lengths, labels, start_index= 0, tag_step= False):
         durations = durations.to(self.device, non_blocking=True)
         tokens = tokens.to(self.device, non_blocking=True)
         notes = notes.to(self.device, non_blocking=True)
+        token_lengths = token_lengths.to(self.device, non_blocking=True)
 
         predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model(
             durations= durations,
             tokens= tokens,
-            notes= notes
+            notes= notes,
+            token_lengths = token_lengths
             )
         
         files = []
@@ -415,12 +413,12 @@ class Trainer:
 
         self.model.eval()
 
-        for step, (durations, tokens, notes, labels) in tqdm(
+        for step, (durations, tokens, notes, token_lengths, labels) in tqdm(
             enumerate(self.dataLoader_Dict['Inference']),
             desc='[Inference]',
             total= math.ceil(len(self.dataLoader_Dict['Inference'].dataset) / (self.hp.Inference_Batch_Size or self.hp.Train.Batch_Size))
             ):
-            self.Inference_Step(durations, tokens, notes, labels, start_index= step * (self.hp.Inference_Batch_Size or self.hp.Train.Batch_Size))
+            self.Inference_Step(durations, tokens, notes, token_lengths, labels, start_index= step * (self.hp.Inference_Batch_Size or self.hp.Train.Batch_Size))
 
         self.model.train()
 

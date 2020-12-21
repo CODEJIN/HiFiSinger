@@ -7,13 +7,10 @@ import pickle, os
 from random import randint
 from multiprocessing import Manager
 
-def Text_to_Token(notes, token_dict):
-    return [
-        (abs_Duration, duration, token_dict[text], note)
-        for abs_Duration, duration, text, note in notes
-        ]
+def Text_to_Token(text: list, token_dict: dict):
+    return [token_dict[x] for x in text]
 
-def Mel_Stack(mels, max_abs_mel):
+def Mel_Stack(mels: list, max_abs_mel: float):
     max_Mel_Length = max([mel.shape[0] for mel in mels])
     mels = np.stack(
         [np.pad(mel, [[0, max_Mel_Length - mel.shape[0]], [0, 0]], constant_values= -max_abs_mel) for mel in mels],
@@ -22,7 +19,7 @@ def Mel_Stack(mels, max_abs_mel):
 
     return mels
 
-def Silence_Stack(silences):
+def Silence_Stack(silences: list):
     max_Silences_Length = max([silence.shape[0] for silence in silences])
     silences = np.stack(
         [np.pad(silence, [0, max_Silences_Length - silence.shape[0]], constant_values= 0.0) for silence in silences],
@@ -31,7 +28,7 @@ def Silence_Stack(silences):
 
     return silences
 
-def Pitch_Stack(pitches):
+def Pitch_Stack(pitches: list):
     max_Pitch_Length = max([pitch.shape[0] for pitch in pitches])
     pitches = np.stack(
         [np.pad(pitch, [0, max_Pitch_Length - pitch.shape[0]], constant_values= 0.0) for pitch in pitches],
@@ -41,16 +38,46 @@ def Pitch_Stack(pitches):
     return pitches
 
 
-def Duration_Correct(durations):
+def Duration_Stack(durations: list):
     '''
-    IMPORTANT:
-    The last value of each duration must be '0'.
-    This value will be changed to the padding value to correct length difference.
+    The length of durations becomes +1 for padding value of each duration.
     '''
-    sum_Durations = np.sum(durations, axis= 1)
-    durations[:, -1] = np.max(sum_Durations) - sum_Durations
-
+    max_Duration = max([np.sum(duration) for duration in durations])
+    max_Duration_Length = max([len(duration) for duration in durations]) + 1    # 1 is for padding duration(max - sum).
+    
+    durations = np.stack(
+        [np.pad(duration, [0, max_Duration_Length - len(duration)], constant_values= 0) for duration in durations],
+        axis= 0
+        )
+    durations[:, -1] = max_Duration - np.sum(durations, axis= 1)   # To fit the time after sample
+        
     return durations
+
+def Token_Stack(tokens: list, token_dict: dict):
+    '''
+    The length of tokens becomes +1 for padding value of each duration.
+    '''    
+    max_Token_Length = max([len(token) for token in tokens]) + 1    # 1 is for padding '<X>'
+    
+    tokens = np.stack(
+        [np.pad(token, [0, max_Token_Length - len(token)], constant_values= token_dict['<X>']) for token in tokens],
+        axis= 0
+        )
+        
+    return tokens
+
+def Note_Stack(notes: list):
+    '''
+    The length of notes becomes +1 for padding value of each duration.
+    '''    
+    max_Note_Length = max([len(note) for note in notes]) + 1    # 1 is for padding '<X>'
+    
+    notes = np.stack(
+        [np.pad(note, [0, max_Note_Length - len(note)], constant_values= 0) for note in notes],
+        axis= 0
+        )
+        
+    return notes
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -81,7 +108,8 @@ class Dataset(torch.utils.data.Dataset):
 
         path = os.path.join(self.pattern_Path, self.patterns[idx]).replace('\\', '/')
         pattern_Dict = pickle.load(open(path, 'rb'))
-        pattern = Text_to_Token(pattern_Dict['Note'], self.token_Dict), pattern_Dict['Mel'], pattern_Dict['Silence'], pattern_Dict['Pitch']
+
+        pattern = pattern_Dict['Duration'], Text_to_Token(pattern_Dict['Text'], self.token_Dict), pattern_Dict['Note'], pattern_Dict['Mel'], pattern_Dict['Silence'], pattern_Dict['Pitch']
         if self.use_cache:
             self.cache_Dict[self.metadata_Path, idx % self.base_Length] = pattern
         
@@ -103,11 +131,12 @@ class Inference_Dataset(torch.utils.data.Dataset):
 
         self.patterns = []
         for path in pattern_paths:
-            notes = [
-                (None, int(line.strip().split('\t')[0]), line.strip().split('\t')[1], int(line.strip().split('\t')[2]))
+            music = [
+                (int(line.strip().split('\t')[0]), line.strip().split('\t')[1], int(line.strip().split('\t')[2]))
                 for line in open(path, 'r', encoding= 'utf-8').readlines()[1:]
                 ]
-            self.patterns.append((notes, path))
+            duration, text, note = zip(*music)
+            self.patterns.append((duration, text, note, path))
 
         self.cache_Dict = Manager().dict()
 
@@ -115,8 +144,8 @@ class Inference_Dataset(torch.utils.data.Dataset):
         if idx in self.cache_Dict.keys():
             return self.cache_Dict['Inference', idx]
 
-        notes, path = self.patterns[idx]
-        pattern = Text_to_Token(notes, self.token_Dict), os.path.splitext(os.path.basename(path))[0]
+        duration, text, note, path = self.patterns[idx]
+        pattern = duration, Text_to_Token(text, self.token_Dict), note, os.path.splitext(os.path.basename(path))[0]
 
         if self.use_cache:
             self.cache_Dict['Inference', idx] = pattern
@@ -131,92 +160,59 @@ class Collater:
     def __init__(
         self,
         token_dict: dict,
-        token_length: int,
-        max_mel_length: int,
-        max_abs_mel: float,
-        max_duration: int
+        max_abs_mel: float
         ):
         self.token_Dict = token_dict
-        self.token_Length = token_length
-        self.max_Mel_Length = max_mel_length
         self.max_ABS_Mel = max_abs_mel
-        self.max_Duration = max_duration
 
     def __call__(self, batch: list):
-        durations, tokens, notes, mels, silences, pitches = [], [], [], [], [], []
-        for music, mel, silence, pitch in batch:
-            for _ in range(10): # If pattern generating failed until 10 times, skipped.
-                offset = randint(0, len(music) - self.token_Length)
-                music_Sample = music[offset:offset + self.token_Length]
-                absolute_duration, duration_Sample, token_Sample, note_Sample = zip(*music_Sample)
-                mel_Sample = mel[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
-                silence_Sample = silence[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
-                pitch_Sample = pitch[absolute_duration[0]:absolute_duration[-1] + duration_Sample[-1]]
-                if all([
-                    mel_Sample.shape[0] < self.max_Mel_Length,
-                    mel_Sample.shape[0] - min([x.shape[0] for x in mels + [mel_Sample]]) < self.max_Duration, #padding also must be shorter than max duration.
-                    max([x.shape[0] for x in mels + [mel_Sample]]) - mel_Sample.shape[0] < self.max_Duration, #padding also must be shorter than max duration.
-                    np.max(duration_Sample) < self.max_Duration
-                    ]):
-                    durations.append(np.array(duration_Sample + (0,), dtype=np.float32))
-                    tokens.append(np.array(token_Sample + (self.token_Dict['<E>'],), dtype=np.float32))
-                    notes.append(np.array(note_Sample + (0,), dtype=np.float32))
-                    mels.append(mel_Sample)
-                    silences.append(silence_Sample)
-                    pitches.append(pitch_Sample)
-                    break
-
+        durations, tokens, notes, mels, silences, pitches = zip(*batch)
+        
+        token_Lengths = [len(token) + 1 for token in tokens]
         mel_Lengths = [mel.shape[0] for mel in mels]
 
-        durations = Duration_Correct(np.stack(durations, axis= 0))
-        tokens = np.stack(tokens, axis= 0)
-        notes = np.stack(notes, axis= 0)
+        durations = Duration_Stack(durations)
+        tokens = Token_Stack(tokens, self.token_Dict)
+        notes = Note_Stack(notes)
         mels = Mel_Stack(mels, self.max_ABS_Mel)
         silences = Silence_Stack(silences)
         pitches = Pitch_Stack(pitches)
 
         durations = torch.LongTensor(durations)   # [Batch, Time]
         tokens = torch.LongTensor(tokens)   # [Batch, Time]
+        token_Lengths = torch.LongTensor(token_Lengths) # [Batch]
         notes = torch.LongTensor(notes)   # [Batch, Time]
         mels = torch.FloatTensor(mels).transpose(2, 1)   # [Batch, Mel_dim, Time]
         mel_Lengths = torch.LongTensor(mel_Lengths)   # [Batch]
         silences = torch.FloatTensor(silences)   # [Batch, Time]
         pitches = torch.FloatTensor(pitches)   # [Batch, Time]
 
-        return durations, tokens, notes, mels, mel_Lengths, silences, pitches
+        return durations, tokens, notes, token_Lengths, mels, silences, pitches, mel_Lengths
 
 class Inference_Collater:
     def __init__(
         self,
         token_dict: dict,
-        max_abs_mel: float,
-        max_duration: int
+        max_abs_mel: float
         ):
         self.token_Dict = token_dict
         self.max_ABS_Mel = max_abs_mel
-        self.max_Duration = max_duration
          
     def __call__(self, batch: list):
-        durations, tokens, notes, labels = [], [], [], []
-        for note, label in batch:            
-            _, duration, token, note = zip(*note)
-            durations.append(np.array(duration + (0,), dtype=np.float32))
-            tokens.append(np.array(token + (self.token_Dict['<E>'],), dtype=np.float32))
-            notes.append(np.array(note + (0,), dtype=np.float32))
-            labels.append(label)
+        durations, tokens, notes, labels = zip(*batch)
 
-        durations = Duration_Correct(np.stack(durations, axis= 0))
-        tokens = np.stack(tokens, axis= 0)
-        notes = np.stack(notes, axis= 0)
+        token_Lengths = [len(token) + 1 for token in tokens]
 
-        if np.max(durations) > self.max_Duration:
-            raise ValueError('There is some notes which have longer duration({}) than max duration({}).'.format(np.max(durations), self.max_Duration))
-
+        durations = Duration_Stack(durations)
+        tokens = Token_Stack(tokens, self.token_Dict)
+        notes = Note_Stack(notes)
+        
         durations = torch.LongTensor(durations)   # [Batch, Time]
         tokens = torch.LongTensor(tokens)   # [Batch, Time]
+        token_Lengths = torch.LongTensor(token_Lengths) # [Batch]
         notes = torch.LongTensor(notes)   # [Batch, Time]
 
-        return durations, tokens, notes, labels
+        return durations, tokens, notes, token_Lengths, labels
 
 if __name__ == "__main__":
     import yaml

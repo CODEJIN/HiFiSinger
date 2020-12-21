@@ -38,6 +38,7 @@ class HifiSinger(torch.nn.Module):
             encodings= encodings,
             durations= durations
             )
+
         decoder_Masks = self.Mask_Generate(
             lengths= durations[:, :-1].sum(dim= 1),
             max_lengths= durations[0].sum()
@@ -49,7 +50,7 @@ class HifiSinger(torch.nn.Module):
             )
         
         predicted_Pitches = predicted_Pitches + torch.stack([
-            note.repeat_interleave(duration)
+            note.repeat_interleave(duration) / self.hp.Max_Note
             for note, duration in zip(notes, durations)
             ], dim= 0)
         
@@ -57,7 +58,7 @@ class HifiSinger(torch.nn.Module):
         predicted_Silences.data.masked_fill_(decoder_Masks, 0.0)   # 0.0 -> Silence, 1.0 -> Voice
         predicted_Pitches.data.masked_fill_(decoder_Masks, 0.0)
 
-        return predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations
+        return predicted_Mels, torch.sigmoid(predicted_Silences), predicted_Pitches, predicted_Durations
 
     def Mask_Generate(self, lengths, max_lengths= None):
         '''
@@ -77,32 +78,28 @@ class Encoder(torch.nn.Module):
             num_embeddings= self.hp.Tokens,
             embedding_dim= self.hp.Encoder.Size,
             )
-        torch.nn.init.xavier_uniform_(self.layer_Dict['Phoneme_Embedding'].weight)
-
         self.layer_Dict['Duration_Embedding'] = torch.nn.Embedding(
             num_embeddings= self.hp.Max_Duration,
             embedding_dim= self.hp.Encoder.Size,
             )
-        torch.nn.init.xavier_uniform_(self.layer_Dict['Duration_Embedding'].weight)
-
         self.layer_Dict['Note_Embedding'] = torch.nn.Embedding(
             num_embeddings= self.hp.Max_Note,
             embedding_dim= self.hp.Encoder.Size,
             )
-        torch.nn.init.xavier_uniform_(self.layer_Dict['Note_Embedding'].weight)
 
         self.layer_Dict['Positional_Embedding'] = Sinusoidal_Positional_Embedding(
-            channels= self.hp.Encoder.Size
+            channels= self.hp.Encoder.Size,
+            dropout= 0.0
             )
-        
+
         for index in range(self.hp.Encoder.FFT_Block.Stacks):
             self.layer_Dict['FFT_Block_{}'.format(index)] = FFT_Block(
                 in_channels= self.hp.Encoder.Size,
                 heads= self.hp.Encoder.FFT_Block.Heads,
                 dropout_rate= self.hp.Encoder.FFT_Block.Dropout_Rate,
-                fft_in_kernel_size= self.hp.Encoder.FFT_Block.FeedForward.In_Kernel_Size,
-                fft_out_kernel_size= self.hp.Encoder.FFT_Block.FeedForward.Out_Kernel_Size,
-                fft_channels= self.hp.Encoder.FFT_Block.FeedForward.Channels,
+                ff_in_kernel_size= self.hp.Encoder.FFT_Block.FeedForward.In_Kernel_Size,
+                ff_out_kernel_size= self.hp.Encoder.FFT_Block.FeedForward.Out_Kernel_Size,
+                ff_channels= self.hp.Encoder.FFT_Block.FeedForward.Channels,
                 )
 
     def forward(
@@ -119,6 +116,7 @@ class Encoder(torch.nn.Module):
         tokens = self.layer_Dict['Phoneme_Embedding'](tokens).transpose(2, 1)     # [Batch, Channels, Time]
         durations = self.layer_Dict['Duration_Embedding'](durations).transpose(2, 1)     # [Batch, Channels, Time]
         notes = self.layer_Dict['Note_Embedding'](notes).transpose(2, 1)     # [Batch, Channels, Time]
+
         x = self.layer_Dict['Positional_Embedding'](tokens + durations + notes)
         for index in range(self.hp.Encoder.FFT_Block.Stacks):
             x = self.layer_Dict['FFT_Block_{}'.format(index)](x, masks)
@@ -137,25 +135,30 @@ class Duration_Predictor(torch.nn.Module):
             self.hp.Duration_Predictor.Conv.Kernel_Size,
             self.hp.Duration_Predictor.Conv.Channels
             )):
-            self.layer_Dict['Conv_{}'.format(index)] = torch.nn.Sequential()
-            self.layer_Dict['Conv_{}'.format(index)].add_module('Conv', Conv1d(
+            self.layer_Dict['Conv_{}'.format(index)] = Conv1d(
                 in_channels= previous_Channels,
                 out_channels= channels,
                 kernel_size= kernel_Size,
                 padding= (kernel_Size - 1) // 2,
-                w_init_gain= 'linear'
-                ))
-            self.layer_Dict['Conv_{}'.format(index)].add_module('BatchNorm', torch.nn.BatchNorm1d(
-                num_features= channels
-                ))
+                w_init_gain= 'relu'
+                )
+            self.layer_Dict['LayerNorm_{}'.format(index)] = torch.nn.LayerNorm(
+                normalized_shape= channels
+                )
+            self.layer_Dict['ReLU_{}'.format(index)] = torch.nn.ReLU()
+            self.layer_Dict['Dropout_{}'.format(index)] = torch.nn.Dropout(
+                p= self.hp.Duration_Predictor.Conv.Dropout_Rate
+                )
             previous_Channels = channels
 
-        self.layer_Dict['Projection'] = Conv1d(
+        self.layer_Dict['Projection'] = torch.nn.Sequential()
+        self.layer_Dict['Projection'].add_module('Conv', Conv1d(
             in_channels= previous_Channels,
             out_channels= 1,
             kernel_size= 1,
-            w_init_gain= 'linear'
-            )
+            w_init_gain= 'relu'
+            ))
+        self.layer_Dict['Projection'].add_module('ReLU', torch.nn.ReLU())
 
     def forward(
         self,
@@ -165,7 +168,9 @@ class Duration_Predictor(torch.nn.Module):
         x = encodings
         for index in range(len(self.hp.Duration_Predictor.Conv.Kernel_Size)):
             x = self.layer_Dict['Conv_{}'.format(index)](x)
-
+            x = self.layer_Dict['LayerNorm_{}'.format(index)](x.transpose(2, 1)).transpose(2, 1)
+            x = self.layer_Dict['ReLU_{}'.format(index)](x)
+            x = self.layer_Dict['Dropout_{}'.format(index)](x)
         predicted_Durations = self.layer_Dict['Projection'](x)
 
         if durations is None:
@@ -207,10 +212,11 @@ class Decoder(torch.nn.Module):
                 in_channels= self.hp.Encoder.Size,
                 heads= self.hp.Decoder.FFT_Block.Heads,
                 dropout_rate= self.hp.Decoder.FFT_Block.Dropout_Rate,
-                fft_in_kernel_size= self.hp.Decoder.FFT_Block.FeedForward.In_Kernel_Size,
-                fft_out_kernel_size= self.hp.Decoder.FFT_Block.FeedForward.Out_Kernel_Size,
-                fft_channels= self.hp.Decoder.FFT_Block.FeedForward.Channels,
+                ff_in_kernel_size= self.hp.Decoder.FFT_Block.FeedForward.In_Kernel_Size,
+                ff_out_kernel_size= self.hp.Decoder.FFT_Block.FeedForward.Out_Kernel_Size,
+                ff_channels= self.hp.Decoder.FFT_Block.FeedForward.Channels,
                 )
+
         self.layer_Dict['Projection'] = Conv1d(
             in_channels= self.hp.Encoder.Size,
             out_channels= self.hp.Sound.Mel_Dim + 1 + 1,
@@ -223,9 +229,10 @@ class Decoder(torch.nn.Module):
         encodings: torch.FloatTensor,
         masks: torch.BoolTensor
         ):
-        x = self.layer_Dict['Positional_Embedding'](encodings)
+        x = encodings
+        x = self.layer_Dict['Positional_Embedding'](x)
         for index in range(self.hp.Encoder.FFT_Block.Stacks):
-            x = self.layer_Dict['FFT_Block_{}'.format(index)](x, masks= None)
+            x = self.layer_Dict['FFT_Block_{}'.format(index)](x, masks= masks)
         x = self.layer_Dict['Projection'](x)
 
         mels, silences, notes = torch.split(
@@ -236,17 +243,15 @@ class Decoder(torch.nn.Module):
 
         return mels, silences.squeeze(1), notes.squeeze(1)
 
-
-
 class FFT_Block(torch.nn.Module):
     def __init__(
         self,
         in_channels: int,
         heads: int,
         dropout_rate: float,
-        fft_in_kernel_size: int,
-        fft_out_kernel_size: int,
-        fft_channels: int
+        ff_in_kernel_size: int,
+        ff_out_kernel_size: int,
+        ff_channels: int
         ):
         super(FFT_Block, self).__init__()
 
@@ -262,17 +267,17 @@ class FFT_Block(torch.nn.Module):
         self.layer_Dict['Conv'] = torch.nn.Sequential()
         self.layer_Dict['Conv'].add_module('Conv_0', Conv1d(
             in_channels= in_channels,
-            out_channels= fft_channels,
-            kernel_size= fft_in_kernel_size,
-            padding= (fft_in_kernel_size - 1) // 2,
+            out_channels= ff_channels,
+            kernel_size= ff_in_kernel_size,
+            padding= (ff_in_kernel_size - 1) // 2,
             w_init_gain= 'relu'
             ))
         self.layer_Dict['Conv'].add_module('ReLU', torch.nn.ReLU())
         self.layer_Dict['Conv'].add_module('Conv_1', Conv1d(
-            in_channels= fft_channels,
+            in_channels= ff_channels,
             out_channels= in_channels,
-            kernel_size= fft_out_kernel_size,
-            padding= (fft_out_kernel_size - 1) // 2,
+            kernel_size= ff_out_kernel_size,
+            padding= (ff_out_kernel_size - 1) // 2,
             w_init_gain= 'linear'
             ))
         self.layer_Dict['Conv'].add_module('Dropout', torch.nn.Dropout(p= dropout_rate))
@@ -283,17 +288,24 @@ class FFT_Block(torch.nn.Module):
     def forward(self, x: torch.FloatTensor, masks: torch.BoolTensor= None):
         '''
         x: [Batch, Channels, Time]
-        '''        
+        '''
         x = self.layer_Dict['Multihead_Attention'](
             query= x.permute(2, 0, 1),
             key= x.permute(2, 0, 1),
             value= x.permute(2, 0, 1),
             key_padding_mask= masks
             )[0].permute(1, 2, 0) + x
-        x = self.layer_Dict['LayerNorm_0'](x.permute(0, 2, 1)).permute(0, 2, 1)
+        x = self.layer_Dict['LayerNorm_0'](x.transpose(2, 1)).transpose(2, 1)
         x = self.layer_Dict['Dropout'](x)
+
+        if not masks is None:
+            x *= torch.logical_not(masks).unsqueeze(1).float()
+
         x = self.layer_Dict['Conv'](x) + x
-        x = self.layer_Dict['LayerNorm_1'](x.permute(0, 2, 1)).permute(0, 2, 1)
+        x = self.layer_Dict['LayerNorm_1'](x.transpose(2, 1)).transpose(2, 1)
+        
+        if not masks is None:
+            x *= torch.logical_not(masks).unsqueeze(1).float()
 
         return x
 
@@ -357,9 +369,7 @@ if __name__ == "__main__":
         )
     collater = Collater(
         token_dict= token_Dict,
-        token_length= hp.Train.Token_Length,
-        max_mel_length= hp.Train.Max_Mel_Length,
-        max_abs_mel= hp.Sound.Max_Abs_Mel
+        max_mel_length= hp.Train.Max_Mel_Length
         )
     dataLoader = torch.utils.data.DataLoader(
         dataset= dataset,
