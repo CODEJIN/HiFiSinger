@@ -1,3 +1,4 @@
+from typing import List
 import torch
 import math
 from argparse import Namespace  # for type
@@ -67,6 +68,95 @@ class HifiSinger(torch.nn.Module):
         sequence = torch.arange(max_lengths or torch.max(lengths))[None, :].to(lengths.device)
         return sequence >= lengths[:, None]    # [Batch, Time]
 
+
+class Discriminators(torch.nn.Module):
+    def __init__(self, hyper_parameters: Namespace) -> None:
+        super(Discriminators, self).__init__()
+        self.hp = hyper_parameters
+
+        self.layer_Dict = torch.nn.ModuleDict()
+
+        for index, frequency_Range in enumerate(self.hp.Discriminator.Frequency_Range):
+            self.layer_Dict['Discriminator_{}'.format(index)] = Discriminator(
+                stacks= self.hp.Discriminator.Stacks,
+                channels= self.hp.Discriminator.Channels,
+                kernel_size= self.hp.Discriminator.Kernel_Size,
+                frequency_range= frequency_Range
+                )
+
+    def forward(
+        self,
+        x: torch.FloatTensor,
+        lengths: torch.LongTensor
+        ):
+        '''
+        x: [Batch, Time]
+        '''
+        return [
+            self.layer_Dict['Discriminator_{}'.format(index)](x, lengths)
+            for index in range(len(self.hp.Discriminator.Frequency_Range))
+            ]
+
+
+
+class Discriminator(torch.nn.Module):
+    def __init__(
+        self,
+        stacks: int,
+        kernel_size: int,
+        channels: int,
+        frequency_range: List[int]
+        ) -> None:
+        super(Discriminator, self).__init__()
+
+        self.frequency_Range = frequency_range
+
+        self.layer = torch.nn.Sequential()
+
+        previous_Channels = 1
+        for index in range(stacks - 1):
+            self.layer.add_module('Conv_{}'.format(index), Conv2d(
+                in_channels= previous_Channels,
+                out_channels= channels,
+                kernel_size= kernel_size,
+                bias= False,
+                w_init_gain= 'linear'
+                ))
+            self.layer.add_module('Leaky_ReLU_{}'.format(index), torch.nn.LeakyReLU(
+                negative_slope= 0.2,
+                inplace= True
+                ))
+            previous_Channels = channels
+
+        self.layer.add_module('Projection', Conv2d(
+            in_channels= previous_Channels,
+            out_channels= 1,
+            kernel_size= 1,
+            bias= True,
+            w_init_gain= 'linear'
+            ))
+
+    def forward(
+        self,
+        x: torch.FloatTensor,
+        lengths: torch.LongTensor
+        ):
+        '''
+        x: [Batch, Mel_dim, Time]
+        '''
+        sampling_Length = lengths.min()
+        mels = []
+        for mel, length in zip(x, lengths):
+            offset = torch.randint(
+                low= 0,
+                high= length - sampling_Length + 1,
+                size= (1,)
+                ).to(x.device)
+            mels.append(mel[self.frequency_Range[0]:self.frequency_Range[1], offset:offset + sampling_Length])
+
+        mels = torch.stack(mels).unsqueeze(dim= 1)    # [Batch, 1, Sampled_Dim, Min_Time]
+
+        return self.layer(mels).squeeze(dim= 1) # [Batch, Sampled_Dim, Min_Time]
 
 class Encoder(torch.nn.Module): 
     def __init__(self, hyper_parameters: Namespace):
@@ -351,6 +441,21 @@ class Conv1d(torch.nn.Conv1d):
         if not self.bias is None:
             torch.nn.init.zeros_(self.bias)
 
+
+class Conv2d(torch.nn.Conv2d):
+    def __init__(self, w_init_gain= 'relu', *args, **kwargs):
+        self.w_init_gain = w_init_gain
+        super(Conv2d, self).__init__(*args, **kwargs)
+
+    def reset_parameters(self):
+        if self.w_init_gain in ['relu', 'leaky_relu']:
+            torch.nn.init.kaiming_uniform_(self.weight, nonlinearity= self.w_init_gain)
+        else:
+            torch.nn.init.xavier_uniform_(self.weight, gain= torch.nn.init.calculate_gain(self.w_init_gain))
+        if not self.bias is None:
+            torch.nn.init.zeros_(self.bias)
+
+
 if __name__ == "__main__":
     import yaml
     from Arg_Parser import Recursive_Parse
@@ -369,7 +474,7 @@ if __name__ == "__main__":
         )
     collater = Collater(
         token_dict= token_Dict,
-        max_mel_length= hp.Train.Max_Mel_Length
+        max_abs_mel= hp.Sound.Max_Abs_Mel
         )
     dataLoader = torch.utils.data.DataLoader(
         dataset= dataset,
@@ -380,12 +485,20 @@ if __name__ == "__main__":
         pin_memory= True
         )
     
-    durations, tokens, notes, mels, mel_Lengths = next(iter(dataLoader))
+    durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths = next(iter(dataLoader))
 
     model = HifiSinger(hp)
     predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = model(
         tokens= tokens,
         durations= durations,
         notes= notes,
-        token_lengths= None,  # token_length == duration_length == note_length
+        token_lengths= token_lengths
         )
+
+
+    discriminator = Discriminators(hp)
+    discriminations = discriminator(predicted_Mels, mel_lengths)
+
+    print(discriminations)
+    for x in discriminations:
+        print(x.shape)

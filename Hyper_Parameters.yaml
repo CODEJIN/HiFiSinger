@@ -55,7 +55,13 @@ Decoder:
             Out_Kernel_Size: 1
             Channels: 1536
 
-Vocoder_Path: null  # Paper is using PWGAN. This part needs another model.
+Discriminator:
+    Stacks: 3
+    Channels: 64
+    Kernel_Size: 9
+    Frequency_Range: [[0, 40], [20, 60], [40, 80]]
+
+Vocoder_Path: 'Vocoder.pts'  # Paper is using PWGAN. This part needs another model.
 
 Token_Path: 'E:/48K.KO_Music/Token.yaml'
 Train:
@@ -68,22 +74,28 @@ Train:
         Path: 'E:/48K.KO_Music/Eval'
         Metadata_File: 'METADATA.PICKLE'
     Num_Workers: 2
-    Batch_Size: 8 # 64
+    Batch_Size: 24 # 8
     Learning_Rate:
-        Initial: 1.0e-4
-        Base: 4000
+        Generator:
+            Initial: 1.0e-4
+            Base: 4000
+        Discriminator: 
+            Initial: 5.0e-5
+            Base: 4000
     ADAM:
         Beta1: 0.9
         Beta2: 0.999
         Epsilon: 1.0e-7
+    Discriminator_Delay: 10000
+
     Weight_Decay: 1.0e-6
     Gradient_Norm: 0.5
-    Max_Step: 200000
-    Checkpoint_Save_Interval: 10000
+    Max_Step: 400000
+    Checkpoint_Save_Interval: 200000
     Logging_Interval: 100
     Evaluation_Interval: 1000
     Inference_Interval: 10000
-    Initial_Inference: false
+    Initial_Inference: true
     Inference_Pattern_in_Train: 'Inference_Text.txt'
 
 Inference_Batch_Size: 4
@@ -91,6 +103,6 @@ Inference_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Inference'
 Checkpoint_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Checkpoint'
 Log_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Log'
 
-Use_Mixed_Precision: false  # apex is required.
+Use_Mixed_Precision: true  # apex is required.
 Use_Multi_GPU: false
-Device: '1'
+Device: '0'
