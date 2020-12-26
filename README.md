@@ -1,6 +1,6 @@
 # HiFiSinger
 
-This code is an implementation of HiFiSinger. The algorithm is based on the following papers:
+This code is an unofficial implementation of HiFiSinger. The algorithm is based on the following papers:
 
 ```
 Chen, J., Tan, X., Luan, J., Qin, T., & Liu, T. Y. (2020). HiFiSinger: Towards High-Fidelity Neural Singing Voice Synthesis. arXiv preprint arXiv:2009.01776.
@@ -71,8 +71,8 @@ Before proceeding, please set the pattern, inference, and checkpoint paths in 'H
     * Setting the parameters of training.
 
 * Use_Mixed_Precision
-    * __Currently, this parameters is ignored.__ 
-    * Several parameters including adversarial weights are affected by the bits of float.
+    * Setting mix precision usage.
+    * Need a [Nvidia-Apex](https://github.com/NVIDIA/apex).
 
 * Inference_Batch_Size
     * Setting the batch size when inference
