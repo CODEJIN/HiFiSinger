@@ -21,10 +21,6 @@ Max_Duration: 1500
 Encoder:
     Size: 384
     Conv_Kernel_Size: [5, 5, 5]
-    Heads: 2
-    Dropout_Rate: 0.1
-    Stacks: 6
-    FeedForward_Channels: 1536
     FFT_Block:
         Heads: 2
         Dropout_Rate: 0.1
@@ -42,10 +38,6 @@ Duration_Predictor:
 
 Decoder:
     Size: 384   # I think this must be same to encoder size.
-    Heads: 2
-    Dropout_Rate: 0.1
-    Stacks: 6
-    FeedForward_Channels: 1536
     FFT_Block:
         Heads: 2
         Dropout_Rate: 0.1

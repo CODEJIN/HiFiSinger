@@ -84,7 +84,7 @@ class Trainer:
             )
         inference_Dataset = Inference_Dataset(
             token_dict= token_Dict,
-            pattern_paths= ['./Inference_for_Training/Example.txt'],
+            pattern_paths= ['./Inference_for_Training/Example.txt', './Inference_for_Training/Example2.txt'],
             use_cache= False
             )
 
