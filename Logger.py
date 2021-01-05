@@ -38,10 +38,11 @@ class Logger(SummaryWriter):
             self.add_image(tag= tag, img_tensor= data, global_step= global_step, walltime= walltime, dataformats= 'HWC')
         self.flush()
 
-    def add_histogram_model(self, model, global_step=None, bins='tensorflow', walltime=None, max_bins=None, delete_keywords= []):
+    def add_histogram_model(self, model, model_label= None, global_step=None, bins='tensorflow', walltime=None, max_bins=None, delete_keywords= []):
         for tag, parameter in model.named_parameters():
-            x = tag
             tag = '/'.join([x for x in tag.split('.') if not x in delete_keywords])
+            if not model_label is None:
+                tag = '{}/{}'.format(model_label, tag)
 
             self.add_histogram(
                 tag= tag,

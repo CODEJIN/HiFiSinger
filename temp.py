@@ -1,20 +1,40 @@
-import torch
+# import numpy as np
+# import mido, os, pickle, yaml, hgtk, argparse, math
+# from tqdm import tqdm
+# import matplotlib.pyplot as plt 
 
-from Modules import FFT_Block
+# paths = []
+# for root, _, files in os.walk('E:/Pattern/Sing/NAMS_MIDI_WAV'):
+#     for file in files:
+#         if os.path.splitext(file)[1] != '.wav':
+#             continue
+#         wav_Path = os.path.join(root, file).replace('//', '/')
+#         midi_Path = wav_Path.replace('Vox.wav', 'Midi.mid')
+#         paths.append((wav_Path, midi_Path))
 
-layer = FFT_Block(
-    in_channels= 384,
-    heads= 4,
-    dropout_rate= 0.1,
-    fft_in_kernel_size= 3,
-    fft_out_kernel_size= 1,
-    fft_channels= 1536
-    )
+# notes = []
 
-x = torch.randn(3, 384, 523)
-out = layer(x)
+# for index, (wav_Path, midi_Path) in enumerate(paths):
+#     mid = mido.MidiFile(midi_Path, charset='CP949')
+#     music = []
+#     current_Lyric = ''
+#     previous_Used = 0
+#     absolute_Position = 0
+#     for message in mid:
+#         if not message.type in ['note_off']:   # Removing end maker.
+#             continue
+        
+#         notes.append(message.note)
 
-print(out.shape)
 
+# print(min(notes), max(notes))
+# plt.hist(notes, 41)
+# plt.show()
 
-np.where(np.mean(x['Mel'], axis=1) < -3.0, np.zeros_like(np.mean(x['Mel'], axis=1)), np.ones_like(np.mean(x['Mel'], axis=1)))
+import pickle
+
+a = pickle.load(open("E:/48K.KO_Music/Train/NAMS/000/NAMS.S_000.P_00016.pickle", 'rb'))
+b = pickle.load(open("E:/48K.KO_Music/Train/NAMS/001/NAMS.S_001.P_00011.pickle", 'rb'))
+
+list(zip(a['Text'], a['Note']))
+list(zip(b['Text'], b['Note']))

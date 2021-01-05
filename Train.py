@@ -255,7 +255,7 @@ class Trainer:
         else:
             loss_Dict['Generator'].backward()
             torch.nn.utils.clip_grad_norm_(
-                parameters= self.optimizer_Dict['Generator'],
+                parameters= self.optimizer_Dict['Generator'].parameters(),
                 max_norm=  self.hp.Train.Gradient_Norm
                 )
         self.optimizer_Dict['Generator'].step()
@@ -287,7 +287,7 @@ class Trainer:
             else:
                 loss_Dict['Discriminator'].backward()
                 torch.nn.utils.clip_grad_norm_(
-                    parameters= self.optimizer_Dict['Discriminator'],
+                    parameters= self.optimizer_Dict['Discriminator'].parameters(),
                     max_norm= self.hp.Train.Gradient_Norm
                     )
             self.optimizer_Dict['Discriminator'].step()
@@ -409,7 +409,8 @@ class Trainer:
             for tag, loss in self.scalar_Dict['Evaluation'].items()
             }
         self.writer_Dict['Evaluation'].add_scalar_dict(self.scalar_Dict['Evaluation'], self.steps)
-        self.writer_Dict['Evaluation'].add_histogram_model(self.model, self.steps, delete_keywords=['layer_Dict', 'layer'])
+        self.writer_Dict['Evaluation'].add_histogram_model(self.model_Dict['Generator'], 'Generator', self.steps, delete_keywords=['layer_Dict', 'layer'])
+        self.writer_Dict['Evaluation'].add_histogram_model(self.model_Dict['Discriminator'], 'Discriminator', self.steps, delete_keywords=['layer_Dict', 'layer'])
         self.scalar_Dict['Evaluation'] = defaultdict(float)
 
         duration = durations[-1]
