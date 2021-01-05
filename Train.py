@@ -255,7 +255,7 @@ class Trainer:
         else:
             loss_Dict['Generator'].backward()
             torch.nn.utils.clip_grad_norm_(
-                parameters= self.optimizer_Dict['Generator'].parameters(),
+                parameters= self.model_Dict['Generator'].parameters(),
                 max_norm=  self.hp.Train.Gradient_Norm
                 )
         self.optimizer_Dict['Generator'].step()
@@ -287,7 +287,7 @@ class Trainer:
             else:
                 loss_Dict['Discriminator'].backward()
                 torch.nn.utils.clip_grad_norm_(
-                    parameters= self.optimizer_Dict['Discriminator'].parameters(),
+                    parameters= self.model_Dict['Discriminator'].parameters(),
                     max_norm= self.hp.Train.Gradient_Norm
                     )
             self.optimizer_Dict['Discriminator'].step()
