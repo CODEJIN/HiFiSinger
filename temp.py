@@ -60,19 +60,39 @@
 
 import mido, os, pickle, yaml, hgtk, argparse, math
 
-# for root, _, files in os.walk('C:/Users/Heejo/Desktop/작업 파일/'):
-#     for file in files:
-#         if os.path.splitext(file)[1] != '.mid':
-#             continue
-#         wav_Path = os.path.join(root, file).replace('//', '/')
-#         midi_Path = wav_Path.replace('Vox.wav', 'Midi.mid')
-#         paths.append((wav_Path, midi_Path))
+# # for root, _, files in os.walk('C:/Users/Heejo/Desktop/작업 파일/'):
+# #     for file in files:
+# #         if os.path.splitext(file)[1] != '.mid':
+# #             continue
+# #         wav_Path = os.path.join(root, file).replace('//', '/')
+# #         midi_Path = wav_Path.replace('Vox.wav', 'Midi.mid')
+# #         paths.append((wav_Path, midi_Path))
 
-mid = mido.MidiFile('C:/Users/Heejo/Desktop/작업 파일/76. 00488 물들어 MIDI.mid', charset='CP949')
-music = []
-current_Lyric = ''
-previous_Used = 0
-absolute_Position = 0
+mid = mido.MidiFile('E:/Pattern/Sing/108곡 시작 끝 Note 수정 작업 파일/02 박자 작업 x/13432편지midi.mid', charset='CP949')
+x = 0
 for message in mid:
-    if message.type == 'lyrics':
-        print(message)
+    print(message)
+    x += message.time
+print(x)
+
+    # if message.type == 'lyrics':
+    #     print(message)
+    
+    # duration = int(message.time * 48000)
+    # duration //= 240
+    # print(message, duration)
+
+        
+# import os
+# for root, _, files in os.walk('E:/Pattern/Sing/108곡 시작 끝 Note 수정 작업 파일/'):
+#     for file in sorted(files):
+#         if os.path.splitext(file)[1] != '.wav':
+#             continue
+#         wav_Path = os.path.join(root, file).replace('\\', '/')
+#         midi_Path = wav_Path.replace('vox.wav', 'midi.mid')
+
+#         if not os.path.exists(midi_Path):
+#             print(wav_Path)
+#             print(midi_Path)
+            
+            

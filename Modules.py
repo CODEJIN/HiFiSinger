@@ -2,6 +2,12 @@ from typing import List
 import torch
 import math
 from argparse import Namespace  # for type
+import logging
+
+from nvlabs.torch_utils.ops import conv2d_gradfix
+from nvlabs.torch_utils.ops.conv2d_gradfix import conv2d as nvlabs_conv2d, no_weight_gradients
+
+conv2d_gradfix.enabled = True
 
 class HifiSinger(torch.nn.Module):
     def __init__(self, hyper_parameters: Namespace):
@@ -68,7 +74,6 @@ class HifiSinger(torch.nn.Module):
         sequence = torch.arange(max_lengths or torch.max(lengths))[None, :].to(lengths.device)
         return sequence >= lengths[:, None]    # [Batch, Time]
 
-
 class Discriminators(torch.nn.Module):
     def __init__(self, hyper_parameters: Namespace) -> None:
         super(Discriminators, self).__init__()
@@ -96,8 +101,6 @@ class Discriminators(torch.nn.Module):
             self.layer_Dict['Discriminator_{}'.format(index)](x, lengths)
             for index in range(len(self.hp.Discriminator.Frequency_Range))
             ]
-
-
 
 class Discriminator(torch.nn.Module):
     def __init__(
@@ -154,7 +157,7 @@ class Discriminator(torch.nn.Module):
                 ).to(x.device)
             mels.append(mel[self.frequency_Range[0]:self.frequency_Range[1], offset:offset + sampling_Length])
 
-        mels = torch.stack(mels).unsqueeze(dim= 1)    # [Batch, 1, Sampled_Dim, Min_Time]
+        mels = torch.stack(mels).unsqueeze(dim= 1)    # [Batch, 1, Sampled_Dim, Min_Time])
 
         return self.layer(mels).squeeze(dim= 1) # [Batch, Sampled_Dim, Min_Time]
 
@@ -387,10 +390,8 @@ class FFT_Block(torch.nn.Module):
             )[0].permute(1, 2, 0) + x
         x = self.layer_Dict['LayerNorm_0'](x.transpose(2, 1)).transpose(2, 1)
         x = self.layer_Dict['Dropout'](x)
-
         if not masks is None:
             x *= torch.logical_not(masks).unsqueeze(1).float()
-
         x = self.layer_Dict['Conv'](x) + x
         x = self.layer_Dict['LayerNorm_1'](x.transpose(2, 1)).transpose(2, 1)
         
@@ -417,43 +418,76 @@ class Sinusoidal_Positional_Embedding(torch.nn.Module):
         x = x + self.pe[:, :, :x.size(2)]
         return self.dropout(x)
 
-class Conv1d(torch.nn.Conv1d):
-    def __init__(self, w_init_gain= 'relu', *args, **kwargs):
-        self.w_init_gain = w_init_gain
-        super(Conv1d, self).__init__(*args, **kwargs)
-
-    def reset_parameters(self):
-        gains = self.w_init_gain
-        if isinstance(gains, str) or isinstance(gains, float):
-            gains = [gains]
-        
-        weights = torch.chunk(self.weight, len(gains), dim= 0)
-        for gain, weight in zip(gains, weights):
-            if gain == 'zero':
-                torch.nn.init.zeros_(weight)
-            elif gain in ['relu', 'leaky_relu']:
-                torch.nn.init.kaiming_uniform_(weight, nonlinearity= gain)
-            else:
-                if type(gain) == str:
-                    gain = torch.nn.init.calculate_gain(gain)
-                torch.nn.init.xavier_uniform_(weight, gain= gain)
-
-        if not self.bias is None:
-            torch.nn.init.zeros_(self.bias)
-
 
 class Conv2d(torch.nn.Conv2d):
-    def __init__(self, w_init_gain= 'relu', *args, **kwargs):
+    def __init__(self, w_init_gain= 'relu', clamp: float=None, *args, **kwargs):
         self.w_init_gain = w_init_gain
-        super(Conv2d, self).__init__(*args, **kwargs)
+        self.clamp = clamp
+
+        super().__init__(*args, **kwargs)
+        self.runtime_Coef = 1.0 / math.sqrt(self.in_channels * self.kernel_size[0] * self.kernel_size[1])
 
     def reset_parameters(self):
-        if self.w_init_gain in ['relu', 'leaky_relu']:
-            torch.nn.init.kaiming_uniform_(self.weight, nonlinearity= self.w_init_gain)
-        else:
-            torch.nn.init.xavier_uniform_(self.weight, gain= torch.nn.init.calculate_gain(self.w_init_gain))
+        torch.nn.init.normal_(self.weight, mean=0.0, std= 1.0)
         if not self.bias is None:
             torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor):
+        x = nvlabs_conv2d(
+            input= x,
+            weight= self.weight.to(x.device) * self.runtime_Coef,
+            stride= self.stride,
+            padding= (int((self.kernel_size[0] - self.stride[0]) / 2), int((self.kernel_size[1] - self.stride[0]) / 2))
+            )   # [Batch, Out, Resolution, Resolution]
+
+        if not self.bias is None:
+            x += self.bias.to(x.device)[None, :, None, None]
+
+        if not self.clamp is None:
+            x.clamp_(-self.clamp, self.clamp)
+
+        return x
+
+class Conv1d(Conv2d):
+    def __init__(self, w_init_gain= 'relu', clamp: float=None, *args, **kwargs):
+        kwargs['kernel_size'] = (1, kwargs['kernel_size'])
+        super().__init__(w_init_gain, clamp, *args, **kwargs)
+
+    def forward(self, x: torch.Tensor):
+        return super().forward(x.unsqueeze(2)).squeeze(2)
+
+
+
+class Gradient_Penalty(torch.nn.Module):
+    def __init__(
+        self,
+        gamma: float= 10.0
+        ) -> None:
+        super().__init__()
+
+        self.gamma = gamma
+
+    def forward(
+        self,
+        reals: torch.Tensor,
+        discriminations: torch.Tensor,
+        ) -> torch.Tensor:
+        '''
+        reals: [Batch, Channels, Time]. Real mels.
+        discriminations: [Batch]. Discrimination outputs of real mels.
+        '''
+        with no_weight_gradients():
+            gradient_Penalties = torch.autograd.grad(
+                outputs= discriminations.sum(),
+                inputs= reals,
+                create_graph= True,
+                only_inputs= True
+                )[0]
+        gradient_Penalties = gradient_Penalties.square().sum(dim= (1, 2)) * (self.gamma * 0.5)   # [Batch]
+        gradient_Penalties = (gradient_Penalties + reals[:, 0, 0] * 0.0).mean()
+
+        return gradient_Penalties
+
 
 
 if __name__ == "__main__":

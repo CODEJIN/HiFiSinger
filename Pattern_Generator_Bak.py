@@ -26,83 +26,47 @@ def Pattern_Generate(
             if os.path.splitext(file)[1] != '.wav':
                 continue
             wav_Path = os.path.join(root, file).replace('\\', '/')
-            midi_Path = wav_Path.replace('vox.wav', 'midi.mid')
+            midi_Path = wav_Path.replace('Vox.wav', 'Midi.mid')
             paths.append((wav_Path, midi_Path))
 
     for index, (wav_Path, midi_Path) in enumerate(paths):
         mid = mido.MidiFile(midi_Path, charset='CP949')
+        midi_Length = sum([msg.time for msg in mid if msg.type != 'marker']) * hyper_paramters.Sound.Sample_Rate
         music = []
         current_Lyric = ''
-        current_Note = None
-        current_Time = 0.0
-
-        # Note on 쉼표
-        # From Lyric to message before note on: real note
-        for message in list(mid):
-            if message.type == 'note_on':
-                if message.time < 0.1:
-                    current_Time += message.time
-                    if current_Lyric in ['J', 'H', None]:
-                        music.append((current_Time, '<X>', 0))
-                    else:
-                        music.append((current_Time, current_Lyric, current_Note))
-                else:
-                    if not current_Lyric in ['J', 'H', None]:
-                        music.append((current_Time, current_Lyric, current_Note))
-                    else:
-                        message.time += current_Time
-                    music.append((message.time, '<X>', 0))
-                current_Time = 0.0
-                current_Lyric = ''
-                current_Note = None
-            elif message.type == 'lyrics':
-                current_Lyric = message.text.strip()
-                current_Time += message.time
-            elif message.type == 'note_off':
-                current_Note = message.note
-                current_Time += message.time
-                if current_Lyric == 'H':    # it is temp.
-                    break
-            else:
-                current_Time += message.time
-
-        if current_Lyric in ['J', 'H']:
-            if music[-1][1] == '<X>':
-                music[-1] = (music[-1][0] + current_Time, music[-1][1], music[-1][2])
-            else:
-                music.append((current_Time, '<X>', 0))
-        else:
-            music.append((current_Time, current_Lyric, current_Note))
-        music = music[1:]
-
-        audio = Audio_Prep(wav_Path, hyper_paramters.Sound.Sample_Rate)
-        if music[0][1] == '<X>':
-            audio = audio[int(music[0][0] * hyper_paramters.Sound.Sample_Rate):]
-            music = music[1:]
-        if music[-1][1] == '<X>':
-            audio = audio[:-int(music[-1][0] * hyper_paramters.Sound.Sample_Rate)]
-            music = music[:-1]
-
         previous_Used = 0
         absolute_Position = 0
-        mel_Based = []
-        for x in music:
-            duration = int(x[0] * hyper_paramters.Sound.Sample_Rate) + previous_Used
-            previous_Used = duration % hyper_paramters.Sound.Frame_Shift
-            duration = duration // hyper_paramters.Sound.Frame_Shift
-            if x[1] == '<X>':
-                mel_Based.append((absolute_Position, duration, x[1], x[2]))
+        wrong_Midi = False
+        for message in mid:
+            if not message.type in ['note_on', 'lyrics', 'note_off']:   # Removing end maker.
+                continue
+            if message.type == 'note_on':
+                duration = int(message.time * hyper_paramters.Sound.Sample_Rate) + previous_Used
+                previous_Used = duration % hyper_paramters.Sound.Frame_Shift
+                duration = duration // hyper_paramters.Sound.Frame_Shift
+                music.append((absolute_Position, duration, '<X>', 0))
                 absolute_Position += duration
-            else:
-                lyrics = Decompose(x[1])
-                mel_Based.append((absolute_Position, 2, lyrics[0], x[2]))   # Onset
+            elif message.type == 'lyrics':
+                current_Lyric = Decompose(message.text.strip())
+            elif message.type == 'note_off':
+                duration = int(message.time * hyper_paramters.Sound.Sample_Rate) + previous_Used
+                previous_Used = duration % hyper_paramters.Sound.Frame_Shift
+                duration = duration // hyper_paramters.Sound.Frame_Shift
+                music.append((absolute_Position, 2, current_Lyric[0], message.note))   # Onset
                 absolute_Position += 2
-                mel_Based.append((absolute_Position, duration - 4, lyrics[1], x[2]))   # Onset
+                music.append((absolute_Position, duration - 4, current_Lyric[1], message.note))  # excepting onset and coda length
                 absolute_Position += duration - 4
-                mel_Based.append((absolute_Position, 2, lyrics[2], x[2]))   # Onset
+                music.append((absolute_Position, 2, current_Lyric[2], message.note))   # Coda
                 absolute_Position += 2
-        music = mel_Based
 
+                if duration - 4 < 2:    # I want nucleus is also longer than 2.
+                    print('\nToo short note. This data is skipped. Please check it: {}, {}'.format(wav_Path, midi_Path))
+                    wrong_Midi = True
+                    break
+        if wrong_Midi:
+            continue
+
+        audio = Audio_Prep(wav_Path, hyper_paramters.Sound.Sample_Rate)[:int(midi_Length)]  # trimming additional silence of end point
         mel = Mel_Generate(
             audio,
             sample_rate= hyper_paramters.Sound.Sample_Rate,
@@ -113,7 +77,7 @@ def Pattern_Generate(
             mel_fmin= hyper_paramters.Sound.Mel_F_Min,
             mel_fmax= hyper_paramters.Sound.Mel_F_Max,
             max_abs_value= hyper_paramters.Sound.Max_Abs_Mel
-            )[:absolute_Position]
+            )[:absolute_Position]   # Usually, 1 or 2 step of mel is cut.
 
         pitch = pitch_calc(
             sig= audio,
@@ -130,7 +94,7 @@ def Pattern_Generate(
 
         pattern_Index = 0
         for start_Index in tqdm(range(len(music)), desc= os.path.basename(wav_Path)):
-            for end_Index in range(start_Index + 1, len(music), 5):
+            for end_Index in range(start_Index + 1, len(music), 3):
                 music_Sample = music[start_Index:end_Index]
                 sample_Length = music_Sample[-1][0] + music_Sample[-1][1] - music_Sample[0][0]
                 if sample_Length < hyper_paramters.Min_Duration:

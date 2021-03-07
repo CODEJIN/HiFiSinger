@@ -13,7 +13,7 @@ Sound:
     F0_Max: 500
 
 Tokens: 78
-Max_Note: 87
+Max_Note: 100
 Min_Duration: 600
 Max_Duration: 1500
 
@@ -66,7 +66,7 @@ Train:
         Path: 'E:/48K.KO_Music/Eval'
         Metadata_File: 'METADATA.PICKLE'
     Num_Workers: 2
-    Batch_Size: 24 # 8
+    Batch_Size: 32 # 8
     Learning_Rate:
         Generator:
             Initial: 1.0e-4
@@ -74,12 +74,11 @@ Train:
         Discriminator: 
             Initial: 5.0e-5
             Base: 4000
+    Discriminator_Gradient_Panelty_Gamma: 10.0
     ADAM:
         Beta1: 0.9
         Beta2: 0.999
         Epsilon: 1.0e-7
-    Discriminator_Delay: 10000
-
     Weight_Decay: 1.0e-6
     Gradient_Norm: 0.5
     Max_Step: 400000
@@ -91,10 +90,10 @@ Train:
     Inference_Pattern_in_Train: 'Inference_Text.txt'
 
 Inference_Batch_Size: 4
-Inference_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Inference'
-Checkpoint_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Checkpoint'
-Log_Path: 'D:/HiFiSinger.Reuslts/Songs_15/Log'
+Inference_Path: 'D:/HiFiSinger.Reuslts/Songs_108/Inference'
+Checkpoint_Path: 'D:/HiFiSinger.Reuslts/Songs_108/Checkpoint'
+Log_Path: 'D:/HiFiSinger.Reuslts/Songs_108/Log'
 
-Use_Mixed_Precision: true  # apex is required.
+Use_Mixed_Precision: false  # apex is required.
 Use_Multi_GPU: false
 Device: '0'
