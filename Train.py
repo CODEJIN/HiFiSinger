@@ -1,5 +1,6 @@
 import os
 os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T'    # This is ot prevent to be called Fortran Ctrl+C crash in Windows.
+
 import torch
 import numpy as np
 import logging, yaml, sys, argparse, math
@@ -9,14 +10,14 @@ import matplotlib
 matplotlib.use('agg')
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
 
 from Modules import HifiSinger, Discriminators, Gradient_Penalty
 from Datasets import Dataset, Inference_Dataset, Collater, Inference_Collater
 from Radam import RAdam
 from Noam_Scheduler import Modified_Noam_Scheduler
 from Logger import Logger
+
+from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
 from Arg_Parser import Recursive_Parse
 
 logging.basicConfig(
@@ -25,9 +26,10 @@ logging.basicConfig(
     )
 
 class Trainer:
-    def __init__(self, hp_path, steps= 0, gpu_id= 0):
+    def __init__(self, hp_path, steps= 0):
         self.hp_Path = hp_path
-        self.gpu_id = gpu_id
+        self.gpu_id = int(os.getenv('RANK', '0'))
+        self.num_gpus = int(os.getenv("WORLD_SIZE", '1'))
         
         self.hp = Recursive_Parse(yaml.load(
             open(self.hp_Path, encoding='utf-8'),
@@ -37,7 +39,8 @@ class Trainer:
         if not torch.cuda.is_available():
             self.device = torch.device('cpu')
         else:
-            self.device = torch.device('cuda:{}'.format(gpu_id))
+            self.device = torch.device('cuda:{}'.format(self.gpu_id))
+            torch.backends.cudnn.enabled = True
             torch.backends.cudnn.benchmark = True
             torch.cuda.set_device(0)
 
@@ -45,6 +48,8 @@ class Trainer:
 
         self.Datset_Generate()
         self.Model_Generate()
+        self.Load_Checkpoint()
+        self._Set_Distribution()
 
         self.scalar_Dict = {
             'Train': defaultdict(float),
@@ -56,7 +61,6 @@ class Trainer:
             'Evaluation': Logger(os.path.join(self.hp.Log_Path, 'Evaluation')),
             }
         
-        self.Load_Checkpoint()
 
     def Datset_Generate(self):
         token_Dict = yaml.load(open(self.hp.Token_Path), Loader=yaml.Loader)
@@ -165,27 +169,7 @@ class Trainer:
                 )
             }
 
-        if self.hp.Use_Mixed_Precision:
-            amp_Wrapped = amp.initialize(
-                models=[self.model_Dict['Generator'], self.model_Dict['Discriminator']],
-                optimizers=[self.optimizer_Dict['Generator'], self.optimizer_Dict['Discriminator']]
-                )
-            self.model_Dict['Generator'], self.model_Dict['Discriminator'] = amp_Wrapped[0]
-            self.optimizer_Dict['Generator'], self.optimizer_Dict['Discriminator'] = amp_Wrapped[1]
-
-        if self.hp.Use_Multi_GPU:   # This must be later than mixed precision.
-            self.model_Dict['Generator'].requires_grad_(True)  
-            self.model_Dict['Discriminator'].requires_grad_(True)
-            self.model_Dict['Generator'] = DDP(
-                self.model_Dict['Generator'],
-                delay_allreduce=True
-                )
-            self.model_Dict['Discriminator'] = DDP(
-                self.model_Dict['Discriminator'],
-                delay_allreduce=True
-                )
-            self.model_Dict['Generator'].requires_grad_(False)
-            self.model_Dict['Discriminator'].requires_grad_(False)
+        self.scaler = torch.cuda.amp.GradScaler(enabled= self.hp.Use_Mixed_Precision)
 
         self.vocoder = None
         if not self.hp.Vocoder_Path is None:
@@ -211,119 +195,122 @@ class Trainer:
         pitches = pitches.to(self.device, non_blocking=True)
         mel_lengths = mel_lengths.to(self.device, non_blocking=True)
 
-
-        # Generator loss
-        self.optimizer_Dict['Generator'].zero_grad()
-        self.model_Dict['Generator'].requires_grad_(True)
-        predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model_Dict['Generator'](
-            durations= durations,
-            tokens= tokens,
-            notes= notes,
-            token_lengths= token_lengths
-            )
-        discriminations = self.model_Dict['Discriminator'](predicted_Mels, mel_lengths)
-        loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
-        loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
-        loss_Dict['Mel'] = loss_Dict['Mel'].mean()
-        loss_Dict['Silence'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Silences, silences)  # BCE is faster, but loss increase infinity because the silence cannot tracking perfectly.
-        loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
-        loss_Dict['Silence'] = loss_Dict['Silence'].mean()
-        loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
-        loss_Dict['Pitch'] = loss_Dict['Pitch'].sum(dim= 1) / mel_lengths.float()
-        loss_Dict['Pitch'] = loss_Dict['Pitch'].mean()
-        loss_Dict['Predicted_Duration'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Durations, durations.float()).mean()
-        loss_Dict['Adversarial'] = torch.stack([torch.nn.functional.softplus(-x).mean() for x in discriminations]).sum()
-        loss_Dict['Generator'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Pitch'] + loss_Dict['Predicted_Duration'] + loss_Dict['Adversarial']
-        if self.hp.Use_Mixed_Precision:
-            with amp.scale_loss(loss_Dict['Generator'], self.optimizer_Dict['Generator']) as scaled_loss:
-                scaled_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                parameters= amp.master_params(self.optimizer_Dict['Generator']),
-                max_norm= self.hp.Train.Gradient_Norm
+        with torch.cuda.amp.autocast(enabled= self.hp.Use_Mixed_Precision):
+            # Generator loss
+            self.optimizer_Dict['Generator'].zero_grad()
+            self.model_Dict['Generator'].requires_grad_(True)
+            predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations = self.model_Dict['Generator'](
+                durations= durations,
+                tokens= tokens,
+                notes= notes,
+                token_lengths= token_lengths
                 )
-        else:
-            loss_Dict['Generator'].backward()
+            discriminations = self.model_Dict['Discriminator'](predicted_Mels, mel_lengths)
+            loss_Dict['Mel'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Mels, mels)
+            loss_Dict['Mel'] = loss_Dict['Mel'].sum(dim= 2).mean(dim=1) / mel_lengths.float()
+            loss_Dict['Mel'] = loss_Dict['Mel'].mean()
+            loss_Dict['Silence'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Silences, silences)  # BCE is faster, but loss increase infinity because the silence cannot tracking perfectly.
+            loss_Dict['Silence'] = loss_Dict['Silence'].sum(dim= 1) / mel_lengths.float()
+            loss_Dict['Silence'] = loss_Dict['Silence'].mean()
+            loss_Dict['Pitch'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Pitches, pitches)
+            loss_Dict['Pitch'] = loss_Dict['Pitch'].sum(dim= 1) / mel_lengths.float()
+            loss_Dict['Pitch'] = loss_Dict['Pitch'].mean()
+            loss_Dict['Predicted_Duration'] = self.criterion_Dict['Mean_Absolute_Error'](predicted_Durations, durations.float()).mean()
+            loss_Dict['Adversarial'] = torch.stack([torch.nn.functional.softplus(-x).mean() for x in discriminations]).sum()
+            loss_Dict['Generator'] = loss_Dict['Mel'] + loss_Dict['Silence'] + loss_Dict['Pitch'] + loss_Dict['Predicted_Duration'] + loss_Dict['Adversarial']
+
+        self.scaler.scale(loss_Dict['Generator']).backward()
+        if self.hp.Train.Gradient_Norm > 0.0:
+            self.scaler.unscale_(self.optimizer_Dict['Generator'])
             torch.nn.utils.clip_grad_norm_(
                 parameters= self.model_Dict['Generator'].parameters(),
-                max_norm=  self.hp.Train.Gradient_Norm
+                max_norm= self.hp.Train.Gradient_Norm
                 )
+
         self.model_Dict['Generator'].requires_grad_(False)
-        self.optimizer_Dict['Generator'].step()
+        self.scaler.step(self.optimizer_Dict['Generator'])
+        self.scaler.update()
         self.scheduler_Dict['Generator'].step()
 
-        # Fake discrimination
-        self.optimizer_Dict['Discriminator'].zero_grad()
-        self.model_Dict['Discriminator'].requires_grad_(True)
-        fakes, *_ = self.model_Dict['Generator'](
-            durations= durations,
-            tokens= tokens,
-            notes= notes,
-            token_lengths= token_lengths
-            )
-        discriminations = self.model_Dict['Discriminator'](fakes, mel_lengths)
-        loss_Dict['Fake'] = torch.stack([torch.nn.functional.softplus(x).mean() for x in discriminations]).sum()
-        if self.hp.Use_Mixed_Precision:
-            with amp.scale_loss(loss_Dict['Fake'], self.optimizer_Dict['Discriminator']) as scaled_loss:
-                scaled_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                parameters= amp.master_params(self.optimizer_Dict['Discriminator']),
-                max_norm= self.hp.Train.Gradient_Norm
+        with torch.cuda.amp.autocast(enabled= self.hp.Use_Mixed_Precision):
+            # Fake discrimination
+            self.optimizer_Dict['Discriminator'].zero_grad()
+            self.model_Dict['Discriminator'].requires_grad_(True)
+            fakes, *_ = self.model_Dict['Generator'](
+                durations= durations,
+                tokens= tokens,
+                notes= notes,
+                token_lengths= token_lengths
                 )
-        else:
-            loss_Dict['Fake'].backward()
+            discriminations = self.model_Dict['Discriminator'](fakes, mel_lengths)
+            loss_Dict['Fake'] = torch.stack([torch.nn.functional.softplus(x).mean() for x in discriminations]).sum()
+
+
+        self.scaler.scale(loss_Dict['Fake']).backward()
+        if self.hp.Train.Gradient_Norm > 0.0:
+            self.scaler.unscale_(self.optimizer_Dict['Discriminator'])
             torch.nn.utils.clip_grad_norm_(
                 parameters= self.model_Dict['Discriminator'].parameters(),
                 max_norm= self.hp.Train.Gradient_Norm
                 )
+
         self.model_Dict['Discriminator'].requires_grad_(False)
-        self.optimizer_Dict['Discriminator'].step()
+        self.scaler.step(self.optimizer_Dict['Discriminator'])
+        self.scaler.update()
         self.scheduler_Dict['Discriminator'].step()
 
-        # Real discrimination
-        self.optimizer_Dict['Discriminator'].zero_grad()
-        self.model_Dict['Discriminator'].requires_grad_(True)
-        discriminations = self.model_Dict['Discriminator'](mels, mel_lengths)
-        loss_Dict['Real'] = torch.stack([torch.nn.functional.softplus(-x).mean() for x in discriminations]).sum()
-        if self.hp.Use_Mixed_Precision:
-            with amp.scale_loss(loss_Dict['Real'], self.optimizer_Dict['Discriminator']) as scaled_loss:
-                scaled_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                parameters= amp.master_params(self.optimizer_Dict['Discriminator']),
-                max_norm= self.hp.Train.Gradient_Norm
-                )
-        else:
-            loss_Dict['Real'].backward()
+
+        with torch.cuda.amp.autocast(enabled= self.hp.Use_Mixed_Precision):
+            # Real discrimination
+            self.optimizer_Dict['Discriminator'].zero_grad()
+            self.model_Dict['Discriminator'].requires_grad_(True)
+            discriminations = self.model_Dict['Discriminator'](mels, mel_lengths)
+            loss_Dict['Real'] = torch.stack([torch.nn.functional.softplus(-x).mean() for x in discriminations]).sum()
+
+        self.scaler.scale(loss_Dict['Real']).backward()
+        if self.hp.Train.Gradient_Norm > 0.0:
+            self.scaler.unscale_(self.optimizer_Dict['Discriminator'])
             torch.nn.utils.clip_grad_norm_(
                 parameters= self.model_Dict['Discriminator'].parameters(),
                 max_norm= self.hp.Train.Gradient_Norm
                 )
+
         self.model_Dict['Discriminator'].requires_grad_(False)
-        self.optimizer_Dict['Discriminator'].step()
+        self.scaler.step(self.optimizer_Dict['Discriminator'])
+        self.scaler.update()
         self.scheduler_Dict['Discriminator'].step()
 
-        # Gradient penalty
-        reals_for_GP = mels.detach().requires_grad_(True)  # This is required to calculate the gradient penalties.
-        self.optimizer_Dict['Discriminator'].zero_grad()
-        self.model_Dict['Discriminator'].requires_grad_(True)
-        discriminations = self.model_Dict['Discriminator'](reals_for_GP, mel_lengths)
-        loss_Dict['Gradient_Penalty'] = self.criterion_Dict['Gradient_Penalty'](
-            reals= reals_for_GP,
-            discriminations= torch.stack(discriminations, dim= -1).sum(dim= (1,2,3))
-            )
-        if self.hp.Use_Mixed_Precision:
-            with amp.scale_loss(loss_Dict['Gradient_Penalty'], self.optimizer_Dict['Discriminator']) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss_Dict['Gradient_Penalty'].backward()
+
+        with torch.cuda.amp.autocast(enabled= self.hp.Use_Mixed_Precision):
+            # Gradient penalty
+            reals_for_GP = mels.detach().requires_grad_(True)  # This is required to calculate the gradient penalties.
+            self.optimizer_Dict['Discriminator'].zero_grad()
+            self.model_Dict['Discriminator'].requires_grad_(True)
+            discriminations = self.model_Dict['Discriminator'](reals_for_GP, mel_lengths)
+            loss_Dict['Gradient_Penalty'] = self.criterion_Dict['Gradient_Penalty'](
+                reals= reals_for_GP,
+                discriminations= torch.stack(discriminations, dim= -1).sum(dim= (1,2,3))
+                )
+
+        self.scaler.scale(loss_Dict['Gradient_Penalty']).backward()
+        if self.hp.Train.Gradient_Norm > 0.0:
+            self.scaler.unscale_(self.optimizer_Dict['Discriminator'])
+            torch.nn.utils.clip_grad_norm_(
+                parameters= self.model_Dict['Discriminator'].parameters(),
+                max_norm= self.hp.Train.Gradient_Norm
+                )
+
         self.model_Dict['Discriminator'].requires_grad_(False)
-        self.optimizer_Dict['Discriminator'].step()
+        self.scaler.step(self.optimizer_Dict['Discriminator'])
+        self.scaler.update()
         self.scheduler_Dict['Discriminator'].step()
 
         self.steps += 1
         self.tqdm.update(1)
 
         for tag, loss in loss_Dict.items():
-            self.scalar_Dict['Train']['Loss/{}'.format(tag)] += loss.detach().cpu()
+            loss = reduce_tensor(loss.data, self.num_gpus).item() if self.num_gpus > 1 else loss.item()
+            self.scalar_Dict['Train']['Loss/{}'.format(tag)] += loss
 
     def Train_Epoch(self):
         for durations, tokens, notes, token_lengths, mels, silences, pitches, mel_lengths in self.dataLoader_Dict['Train']:
@@ -412,7 +399,8 @@ class Trainer:
         self.optimizer_Dict['Discriminator'].zero_grad()
 
         for tag, loss in loss_Dict.items():
-            self.scalar_Dict['Evaluation']['Loss/{}'.format(tag)] += loss.detach().cpu()
+            loss = reduce_tensor(loss.data, self.num_gpus).item() if self.num_gpus > 1 else loss.item()
+            self.scalar_Dict['Evaluation']['Loss/{}'.format(tag)] += loss
 
         return predicted_Mels, predicted_Silences, predicted_Pitches, predicted_Durations
 
@@ -578,14 +566,8 @@ class Trainer:
 
         state_Dict = torch.load(path, map_location= 'cpu')
         
-
-
-        if self.hp.Use_Multi_GPU:
-            self.model_Dict['Generator'].module.load_state_dict(state_Dict['Generator']['Model'])
-            self.model_Dict['Discriminator'].module.load_state_dict(state_Dict['Discriminator']['Model'])
-        else:
-            self.model_Dict['Generator'].load_state_dict(state_Dict['Generator']['Model'])
-            self.model_Dict['Discriminator'].load_state_dict(state_Dict['Discriminator']['Model'])
+        self.model_Dict['Generator'].load_state_dict(state_Dict['Generator']['Model'])
+        self.model_Dict['Discriminator'].load_state_dict(state_Dict['Discriminator']['Model'])
 
         self.optimizer_Dict['Generator'].load_state_dict(state_Dict['Generator']['Optimizer'])
         self.optimizer_Dict['Discriminator'].load_state_dict(state_Dict['Discriminator']['Optimizer'])
@@ -594,12 +576,6 @@ class Trainer:
         self.scheduler_Dict['Discriminator'].load_state_dict(state_Dict['Discriminator']['Scheduler'])
 
         self.steps = state_Dict['Steps']
-
-        if self.hp.Use_Mixed_Precision:
-            if not 'AMP' in state_Dict.keys():
-                logging.info('No AMP state dict is in the checkpoint. Model regards this checkpoint is trained without mixed precision.')
-            else:                
-                amp.load_state_dict(state_Dict['AMP'])
 
         logging.info('Checkpoint loaded at {} steps in GPU {}.'.format(self.steps, self.gpu_id))
 
@@ -622,8 +598,6 @@ class Trainer:
                 },
             'Steps': self.steps
             }
-        if self.hp.Use_Mixed_Precision:
-            state_Dict['AMP'] = amp.state_dict()
 
         torch.save(
             state_Dict,
@@ -631,6 +605,10 @@ class Trainer:
             )
 
         logging.info('Checkpoint saved at {} steps.'.format(self.steps))
+
+    def _Set_Distribution(self):
+        if self.num_gpus > 1:
+            self.model = apply_gradient_allreduce(self.model)
 
     def Train(self):
         hp_Path = os.path.join(self.hp.Checkpoint_Path, 'Hyper_Parameters.yaml').replace('\\', '/')
@@ -661,23 +639,13 @@ class Trainer:
         self.tqdm.close()
         logging.info('Finished training.')
 
-
-def Worker(gpu, hp_path, steps):
-    torch.distributed.init_process_group(
-        backend= 'nccl',
-        init_method='tcp://127.0.0.1:54321',
-        world_size= torch.cuda.device_count(),
-        rank= gpu
-        )
-
-    new_Trainer = Trainer(hp_path= hp_path, steps= steps, gpu_id= gpu)
-    new_Trainer.Train()
-
 if __name__ == '__main__':
-    argParser = argparse.ArgumentParser()
-    argParser.add_argument('-hp', '--hyper_parameters', required= True, type= str)
-    argParser.add_argument('-s', '--steps', default= 0, type= int)    
-    args = argParser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-hp', '--hyper_parameters', required= True, type= str)
+    parser.add_argument('-s', '--steps', default= 0, type= int)
+    parser.add_argument('-p', '--port', default= 54321, type= int)
+    parser.add_argument('-r', '--local_rank', default= 0, type= int)
+    args = parser.parse_args()
     
     hp = Recursive_Parse(yaml.load(
         open(args.hyper_parameters, encoding='utf-8'),
@@ -686,11 +654,12 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = hp.Device
 
     if hp.Use_Multi_GPU:
-        mp.spawn(
-            Worker,
-            nprocs= torch.cuda.device_count(),
-            args= (args.hyper_parameters, args.steps)
+        init_distributed(
+            rank= int(os.getenv('RANK', '0')),
+            num_gpus= int(os.getenv("WORLD_SIZE", '1')),
+            dist_backend= 'nccl',
+            dist_url= 'tcp://127.0.0.1:{}'.format(args.port)
             )
     else:
-        new_Trainer = Trainer(hp_path= args.hyper_parameters, steps= args.steps, gpu_id= 0)
+        new_Trainer = Trainer(hp_path= args.hyper_parameters, steps= args.steps)
         new_Trainer.Train()

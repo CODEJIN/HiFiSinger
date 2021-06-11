@@ -108,6 +108,10 @@ def _conv2d_gradfix(transpose, weight_shape, stride, padding, output_padding, di
         @staticmethod
         def forward(ctx, input, weight, bias):
             assert weight.shape == weight_shape
+            weight = weight.to(input.dtype)
+            if not bias is None:
+                bias = bias.to(input.dtype)
+
             if not transpose:
                 output = torch.nn.functional.conv2d(input=input, weight=weight, bias=bias, **common_kwargs)
             else: # transpose
@@ -118,6 +122,8 @@ def _conv2d_gradfix(transpose, weight_shape, stride, padding, output_padding, di
         @staticmethod
         def backward(ctx, grad_output):
             input, weight = ctx.saved_tensors
+            grad_output = grad_output.to(input.dtype)
+            
             grad_input = None
             grad_weight = None
             grad_bias = None
