@@ -29,7 +29,7 @@ Please see the 'requirements.txt'.
 # Used dataset
 * Code verification was conducted through a limited-sized, private Korean dataset.
     * Thus, current [Pattern_Generator.py](Pattern_Generator.py) and [Datasets.py](Datasets.py) are based on the Korean.
-* Please report the information aboyt any available open source dataset.
+* Please report the information about any available open source dataset.
     * The set of midi files with syncronized lyric and high resolution vocal wave files
 
 
